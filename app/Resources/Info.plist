@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>MagicKey</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.magickey.MagicKey</string>
+    <key>CFBundleName</key>
+    <string>MagicKey</string>
+    <key>CFBundleDisplayName</key>
+    <string>MagicKey</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+
+    <!-- 菜单栏应用：不显示 Dock 图标，不进 App 切换器 -->
+    <key>LSUIElement</key>
+    <true/>
+
+    <key>NSHumanReadableCopyright</key>
+    <string>MagicKey · MIT License</string>
+</dict>
+</plist>
