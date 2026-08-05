@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 
 struct FrameContext {
     let time: TimeInterval      // 效果开始至今（秒）
@@ -133,6 +134,103 @@ final class StrobeEffect: Effect {
     func tick(_ ctx: FrameContext) -> Float? {
         let phase = (ctx.time.truncatingRemainder(dividingBy: period)) / period
         return phase < duty ? hi : lo
+    }
+}
+
+// MARK: - 按键脉冲
+//
+// 「按下某个键，光以它为中心向四周扩散」做不到，也不要再试：
+// 全部 LED 共用一路 PWM，`setBrightness:forKeyboard:` 一块键盘只收一个 float
+// （Driver.swift）。没有分区、没有单键地址，扩散所需的空间维度根本不存在。
+//
+// 能做的是它在时间域上的等价物：敲键的瞬间整块键盘冲亮，然后衰减回底色。
+//
+// **不需要输入监控权限。** `CGEventSource.secondsSinceLastEventType` 是公开 API，
+// 只返回「距上次按键多少秒」，不给按键内容，不弹授权框——IdleMonitor 早就在用
+// 同一个调用做空闲检测。代价是拿不到「按了哪个键」，
+// 而硬件本来就只有一个全局亮度寄存器，这个信息也无处可用。限制和需求正好抵消。
+
+/// 距上次按键的秒数。参数是效果时间轴上的当前时刻：
+/// 系统实现用不到，合成实现（`--analyze` 需要确定性输入）需要。
+///
+/// 做成注入而非在效果里直接调 CGEventSource，是为了让 `--analyze` 能跑真正的
+/// `KeyPulseEffect`——分析工具一旦另写一份曲线，就会开始骗人。
+typealias KeyPressClock = (TimeInterval) -> TimeInterval
+
+enum KeyPress {
+    /// 真实按键。无需任何授权。
+    static let system: KeyPressClock = { _ in
+        CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown)
+    }
+
+    /// 合成：t=0 敲一次，此后一直空闲。
+    /// 分析器会把 t 从 0 重放好几轮（每个候选帧率一轮），每轮都会重新触发，正合用。
+    static let synthetic: KeyPressClock = { t in t }
+}
+
+/// 按键脉冲：每次敲键，整块键盘从 lo 冲到 hi 再衰减回 lo。
+///
+/// 包络形状受 255 档硬件地板约束（见本文件开头的 gamma 讨论）：
+///   - attack 必须短到感觉不出延迟，但别短到只剩一帧，否则上升沿画不出来
+///   - decay 用幂函数而不是指数：指数永远到不了 0，截断时会留下一个可见的台阶
+final class KeyPulseEffect: Effect {
+    let name = "keypulse"
+    let motionIntent = MotionIntent.punctuated
+
+    private let attack: Double
+    private let decay: Double
+    private let lo: Float
+    private let hi: Float
+    private let clock: KeyPressClock
+
+    /// 仍在衰减中的按键时刻（效果时间轴）。连打时各自的包络取 max 叠成波浪。
+    private var presses: [Double] = []
+    private var lastIdle = Double.infinity
+
+    private static let maxConcurrent = 16
+
+    /// - Parameter duration: 单次脉冲的总时长（attack + decay）
+    init(duration: Double, min lo: Float, max hi: Float, clock: @escaping KeyPressClock) {
+        let d = Swift.max(duration, 0.1)
+        // 40ms 起手：60fps 下约 2.4 帧，够画出上升沿，加上最多一帧的检测延迟
+        // 仍在「和敲击同时发生」的感知范围内。
+        self.attack = Swift.min(0.04, d * 0.2)
+        self.decay = d - self.attack
+        self.lo = lo
+        self.hi = hi
+        self.clock = clock
+    }
+
+    func tick(_ ctx: FrameContext) -> Float? {
+        let idle = clock(ctx.time)
+
+        // 空闲时间回落 = 上一帧之后有新按键。
+        // 同一帧内按下多个键只记一次——相隔 16ms 的两次脉冲本来也分辨不出。
+        if idle < lastIdle {
+            // 减 idle 而不是直接用 ctx.time：按下的瞬间落在帧与帧之间，
+            // 这样上升沿的起点是亚帧精度的，不会被量化到帧边界。
+            presses.append(ctx.time - idle)
+            if presses.count > Self.maxConcurrent { presses.removeFirst() }
+        }
+        lastIdle = idle
+
+        let span = attack + decay
+        presses.removeAll { ctx.time - $0 > span }
+
+        var amp: Float = 0
+        for p in presses { amp = Swift.max(amp, envelope(ctx.time - p)) }
+        return lo + (hi - lo) * amp
+    }
+
+    private func envelope(_ t: Double) -> Float {
+        guard t >= 0 else { return 0 }
+        if t < attack {
+            let u = t / attack
+            return Float(u * u * (3 - 2 * u))       // smoothstep：起点不留硬拐角
+        }
+        let u = (t - attack) / decay
+        guard u < 1 else { return 0 }
+        return Float(pow(1 - u, 1.6))               // 离峰即走，接近 lo 时才慢下来
     }
 }
 

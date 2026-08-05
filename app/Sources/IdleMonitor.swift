@@ -21,6 +21,7 @@ final class IdleMonitor {
     private var userIdle = false
 
     private var idleTimer: Timer?
+    private var pollInterval: TimeInterval = 0
     private var observers: [NSObjectProtocol] = []
     private var lastReported: Bool?
 
@@ -32,6 +33,8 @@ final class IdleMonitor {
     var enabled = true {
         didSet {
             if !enabled { userIdle = false }
+            // 否则关掉空闲检测后会留下一个 1Hz 的空转定时器
+            if idleTimer != nil { schedulePoll(Self.activeInterval) }
             publish(enabled ? "空闲检测已开启" : "空闲检测已关闭")
         }
     }
@@ -62,13 +65,7 @@ final class IdleMonitor {
         observeDistributed("com.apple.screenIsLocked")   { self.screenLocked = true;  self.publish("锁屏") }
         observeDistributed("com.apple.screenIsUnlocked") { self.screenLocked = false; self.publish("解锁") }
 
-        // 用户无输入检测。5 秒一次 = 0.2Hz，开销可忽略；
-        // 用高频轮询来判断「是否空闲」本身就自相矛盾。
-        let t = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.pollUserIdle() }
-        }
-        RunLoop.main.add(t, forMode: .common)
-        idleTimer = t
+        schedulePoll(Self.activeInterval)
 
         publish("启动")
     }
@@ -76,10 +73,29 @@ final class IdleMonitor {
     func stop() {
         idleTimer?.invalidate()
         idleTimer = nil
+        pollInterval = 0
         let ws = NSWorkspace.shared.notificationCenter
         let dc = DistributedNotificationCenter.default()
         for o in observers { ws.removeObserver(o); dc.removeObserver(o) }
         observers.removeAll()
+    }
+
+    // 轮询间隔。用高频轮询判断「是否空闲」本身就自相矛盾，所以活跃时 5 秒一次；
+    // 但已经判定空闲后要反过来——那时轮询决定的是「多久才恢复」。
+    // 按键脉冲效果下 5 秒的恢复延迟等于回来敲的头几个键完全没反应。
+    // 空闲期间 1Hz 的开销相对 60Hz 渲染可以忽略，而且此时引擎本来就停着。
+    private static let activeInterval: TimeInterval = 5
+    private static let idleInterval: TimeInterval = 1
+
+    private func schedulePoll(_ interval: TimeInterval) {
+        guard pollInterval != interval else { return }
+        pollInterval = interval
+        idleTimer?.invalidate()
+        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.pollUserIdle() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        idleTimer = t
     }
 
     private func pollUserIdle() {
@@ -88,6 +104,7 @@ final class IdleMonitor {
         let now = idle >= idleThreshold
         if now != userIdle {
             userIdle = now
+            schedulePoll(now ? Self.idleInterval : Self.activeInterval)
             publish(now ? "用户空闲 \(Int(idle))s" : "用户恢复活动")
         }
     }

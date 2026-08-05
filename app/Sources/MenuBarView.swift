@@ -27,7 +27,7 @@ struct MenuBarView: View {
             footer
         }
         .padding(16)
-        .frame(width: 300)
+        .frame(width: 330)     // 5 个分段，300 时「常亮」会被截断
     }
 
     // MARK: -
@@ -58,21 +58,30 @@ struct MenuBarView: View {
             }
             .labelsHidden()
             .pickerStyle(.segmented)
+
+            if settings.kind == .keyPulse {
+                // 先说清楚做不到什么，免得用户以为是 bug：
+                // 内置键盘只有一路全局 PWM，没有单键或分区控制。
+                Text("每次敲键整块键盘闪一下。硬件只有一路全局背光，无法从单个按键扩散。")
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
     private var periodSlider: some View {
-        labeled("周期", String(format: "%.1f s", settings.period)) {
+        labeled(settings.kind.periodLabel, String(format: "%.2f s", settings.period)) {
             Slider(value: $settings.period, in: settings.kind.periodRange)
         }
     }
 
     private var brightnessSliders: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            labeled("最暗", String(format: "%.0f%%", settings.lo * 100)) {
+        let labels = settings.kind.levelLabels
+        return VStack(alignment: .leading, spacing: 10) {
+            labeled(labels.lo, String(format: "%.0f%%", settings.lo * 100)) {
                 Slider(value: $settings.lo, in: 0...0.95)
             }
-            labeled("最亮", String(format: "%.0f%%", settings.hi * 100)) {
+            labeled(labels.hi, String(format: "%.0f%%", settings.hi * 100)) {
                 Slider(value: $settings.hi, in: 0.05...1)
             }
         }

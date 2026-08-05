@@ -6,6 +6,7 @@ enum EffectKind: String, CaseIterable, Identifiable {
     case breathe
     case heartbeat
     case strobe
+    case keyPulse = "keypulse"
 
     var id: String { rawValue }
 
@@ -15,6 +16,7 @@ enum EffectKind: String, CaseIterable, Identifiable {
         case .breathe:     return "呼吸"
         case .heartbeat:   return "心跳"
         case .strobe:      return "频闪"
+        case .keyPulse:    return "按键"
         }
     }
 
@@ -24,6 +26,7 @@ enum EffectKind: String, CaseIterable, Identifiable {
         case .breathe:     return "wave.3.right"
         case .heartbeat:   return "heart"
         case .strobe:      return "bolt"
+        case .keyPulse:    return "hand.tap"
         }
     }
 
@@ -34,6 +37,7 @@ enum EffectKind: String, CaseIterable, Identifiable {
         case .breathe:     return 1...20
         case .heartbeat:   return 0.6...3
         case .strobe:      return 0.1...2
+        case .keyPulse:    return 0.15...1.5
         }
     }
 
@@ -43,7 +47,18 @@ enum EffectKind: String, CaseIterable, Identifiable {
         case .breathe:     return 4
         case .heartbeat:   return 1.2
         case .strobe:      return 0.5
+        case .keyPulse:    return 0.4
         }
+    }
+
+    /// 按键脉冲不循环，「周期」这个词对它是错的
+    var periodLabel: String {
+        self == .keyPulse ? "脉冲时长" : "周期"
+    }
+
+    /// 最暗/最亮两个滑块在按键脉冲下的含义是「静息」和「峰值」
+    var levelLabels: (lo: String, hi: String) {
+        self == .keyPulse ? ("静息亮度", "脉冲峰值") : ("最暗", "最亮")
     }
 }
 
@@ -112,6 +127,8 @@ final class Settings: ObservableObject {
         case .breathe:     return BreatheEffect(period: period, min: Float(lo), max: Float(hi))
         case .heartbeat:   return HeartbeatEffect(period: period, min: Float(lo), max: Float(hi))
         case .strobe:      return StrobeEffect(period: period, min: Float(lo), max: Float(hi))
+        case .keyPulse:    return KeyPulseEffect(duration: period, min: Float(lo), max: Float(hi),
+                                                 clock: KeyPress.system)
         }
     }
 }
