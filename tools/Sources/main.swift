@@ -27,6 +27,7 @@ struct Options {
     var duration = 0.0         // 0 = 一直跑到 Ctrl-C
     var mode = Mode.analyze
     var setValue: Float = 0
+    var periodExplicit = false
 
     enum Mode { case analyze, preview, set }
 }
@@ -38,7 +39,7 @@ func parseArgs() -> Options {
         func val() -> String { it.next() ?? "" }
         switch arg {
         case "--effect":   o.effect = val()
-        case "--period":   o.period = Double(val()) ?? o.period
+        case "--period":   o.period = Double(val()) ?? o.period; o.periodExplicit = true
         case "--min":      o.lo = Float(val()) ?? o.lo
         case "--max":      o.hi = Float(val()) ?? o.hi
         case "--fps":      o.fps = Double(val()) ?? o.fps
@@ -57,8 +58,9 @@ func parseArgs() -> Options {
               --set <0–1>        一次性设置亮度后退出，不做还原（见 TESTING.md）
 
             选项
-              --effect <static|breathe|heartbeat|strobe>   默认 breathe
+              --effect <static|breathe|heartbeat|strobe|keypulse>   默认 breathe
               --period <秒>      效果周期，默认 4.0
+                                 （keypulse 是单次脉冲总时长，默认 0.4）
               --min    <0–1>     亮度下限，默认 0.05
               --max    <0–1>     亮度上限，默认 0.85
               --fps    <帧率>    默认 60
@@ -74,13 +76,20 @@ func parseArgs() -> Options {
     return o
 }
 
-let opts = parseArgs()
+var opts = parseArgs()
+
+// keypulse 的 --period 语义是「单次脉冲时长」，4 秒的默认值对它毫无意义
+if !opts.periodExplicit && opts.effect == "keypulse" { opts.period = 0.4 }
 
 func makeEffect(_ o: Options) -> Effect {
     switch o.effect {
     case "static":    return StaticEffect(level: o.hi)
     case "heartbeat": return HeartbeatEffect(period: o.period, min: o.lo, max: o.hi)
     case "strobe":    return StrobeEffect(period: o.period, min: o.lo, max: o.hi)
+    case "keypulse":
+        // analyze 要确定性输入（t=0 敲一次），preview 要真键盘
+        return KeyPulseEffect(duration: o.period, min: o.lo, max: o.hi,
+                              clock: o.mode == .analyze ? KeyPress.synthetic : KeyPress.system)
     default:          return BreatheEffect(period: o.period, min: o.lo, max: o.hi)
     }
 }

@@ -226,7 +226,8 @@ struct BacklightSnapshot: Codable {
 
 ### v0.2 — 交互反馈
 
-- [ ] `KeyPulse`：敲键触发脉冲，支持连击强度累积
+- [x] `KeyPulse`：敲键触发脉冲，连打时各次包络取 `max` 叠成波浪
+- [ ] `KeyPulse` 作为瞬时层叠加在呼吸等基础层之上（当前是独立的基础层效果）
 - [ ] **CLI + URL Scheme**：`magickey pulse --effect flash` / `magickey://effect/breathe`
 - [ ] 全局快捷键切换效果
 - [ ] 效果预设的导入导出（JSON）
@@ -259,13 +260,24 @@ struct BacklightSnapshot: Codable {
 | 能力 | 所需权限 | 缺失时的行为 |
 |---|---|---|
 | 亮度控制 | **无** | — |
-| 按键脉冲 | 输入监控（`kTCCServiceListenEvent`） | 效果置灰，其余功能正常 |
+| 按键脉冲 | **无**（见下） | — |
 | 系统音频律动 | 音频捕获（`NSAudioCaptureUsageDescription`） | 提示改用麦克风或 BlackHole |
 | 麦克风律动 | 麦克风 | 效果置灰 |
 | 开机自启 | 无（`SMAppService`） | — |
 
+**按键脉冲不使用 `CGEventTap`，因此不需要输入监控权限。**
+这里原本的设计（`CGEventTap` + `.listenOnly` + TCC 授权 + 效果置灰的降级路径）是多余的。
+`CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown)`
+是公开 API，返回一个标量「距上次按键多少秒」，逐帧比较它是否回落即可判定有按键。
+不弹授权框，实测 p99 0.04µs。IdleMonitor 早就在用同一个调用做空闲检测。
+
+代价是拿不到 keycode——而 §1 的硬件结论是全部 LED 共用一路 PWM，
+「按了哪个键」在这个产品里无处可用。**限制与需求正好抵消**，
+所以这不是妥协方案，而是更优解：它顺带把整条隐私红线变成了结构上不可能违反。
+
 **隐私红线**（必须写进 README 并在代码里做到）：
-- `CGEventTap` 只使用 `.listenOnly`，**只取事件发生的时间戳，不读 keycode、不读修饰键、不缓存任何按键内容**
+- 按键检测只读一个标量时间差，**进程内不存在任何能获取按键内容的代码路径**
+- 若未来引入 `CGEventTap`（例如全局快捷键），必须重新评估本节
 - 无网络请求、无遥测、无崩溃上报（或明确 opt-in）
 - 一个会监听全部键盘输入的开源工具，可审计性就是产品的一部分——按键处理路径应尽量短、集中在单个文件，方便人工审计
 
