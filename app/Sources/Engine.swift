@@ -83,6 +83,9 @@ final class Engine: ObservableObject {
     /// applicationWillTerminate 返回后进程就没了。
     func shutdown(reason: String) {
         stopLoop()
+        // 音频采集不靠「没人 drain 就自停」的看门狗来收——那要等 3 秒，
+        // 而 applicationWillTerminate 返回后进程就没了。显式关一次。
+        BeatPulseSource.shared.deactivate()
         guardian?.restore(reason: reason)
         isRunning = false
         status = "已还原（\(reason)）"

@@ -237,7 +237,8 @@ struct BacklightSnapshot: Codable {
 
 ### v0.3 — 音频律动
 
-- [ ] 系统音频采集：macOS 14.4+ 的 Core Audio Process Tap（`AudioHardwareCreateProcessTap`），公开 API
+- [x] 系统音频采集：**macOS 14.2+**（不是 14.4）的 Core Audio Process Tap
+      （`AudioHardwareCreateProcessTap`），公开 API。已实现，见 `Core/AudioTap.swift`
 - [ ] 降级：麦克风采集 / BlackHole 虚拟设备
 - [ ] 频段选择（低频跟鼓点最有效）、灵敏度、attack/release 平滑
 - [ ] 静音自动回落到基础层
@@ -262,7 +263,7 @@ struct BacklightSnapshot: Codable {
 |---|---|---|
 | 亮度控制 | **无** | — |
 | 按键脉冲 | **无**（见下） | — |
-| 系统音频律动 | 音频捕获（`NSAudioCaptureUsageDescription`） | 提示改用麦克风或 BlackHole |
+| 系统音频律动 | **系统录音**（`kTCCServiceAudioCapture` / `NSAudioCaptureUsageDescription`） | 该效果不可用，其余效果照常 |
 | 麦克风律动 | 麦克风 | 效果置灰 |
 | 开机自启 | 无（`SMAppService`） | — |
 

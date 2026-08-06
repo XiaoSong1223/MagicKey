@@ -16,6 +16,7 @@ struct MenuBarView: View {
                 Divider()
                 effectPicker
                 if settings.kind != .staticLevel { periodSlider }
+                if settings.kind == .audioBeat { sensitivitySlider }
                 brightnessSliders
                 Divider()
                 options
@@ -27,7 +28,7 @@ struct MenuBarView: View {
             footer
         }
         .padding(16)
-        .frame(width: 330)     // 5 个分段，300 时「常亮」会被截断
+        .frame(width: 360)     // 6 个分段；330 时最后一格会被截断
     }
 
     // MARK: -
@@ -59,6 +60,12 @@ struct MenuBarView: View {
             .labelsHidden()
             .pickerStyle(.segmented)
 
+            if settings.kind == .audioBeat {
+                // 同样先说清楚做不到什么：律动是整块键盘一起亮，没有频谱条
+                Text("整块键盘跟着音乐的鼓点闪。需要「系统录音」权限（不是麦克风）。")
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if settings.kind == .keyPulse {
                 // 先说清楚做不到什么，免得用户以为是 bug：
                 // 内置键盘只有一路全局 PWM，没有单键或分区控制。
@@ -72,6 +79,25 @@ struct MenuBarView: View {
     private var periodSlider: some View {
         labeled(settings.kind.periodLabel, String(format: "%.2f s", settings.period)) {
             Slider(value: $settings.period, in: settings.kind.periodRange)
+        }
+    }
+
+    /// 灵敏度：滑块往右＝更灵敏，和内部阈值方向相反，所以显示上做了翻转。
+    /// 用户想的是「更灵敏」，不该让他去理解「阈值倍数越小越灵敏」。
+    private var sensitivitySlider: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text("灵敏度").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Text(String(format: "%.2f×", settings.sensitivity))
+                    .font(.caption).monospacedDigit().foregroundStyle(.secondary)
+            }
+            Slider(value: Binding(
+                get: { 3.1 - settings.sensitivity },        // 1.1…2.0 → 2.0…1.1
+                set: { settings.sensitivity = 3.1 - $0 }
+            ), in: 1.1...2.0)
+            Text("放着音乐拖动，找到跟得上又不乱闪的位置")
+                .font(.caption2).foregroundStyle(.secondary)
         }
     }
 

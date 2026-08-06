@@ -182,7 +182,7 @@ enum Analyzer {
             // 而当重复间隔比帧长**稍短**时，idle 每帧递增（增量 = 帧长 − 间隔），
             // 下降沿永远不出现。30fps + 33ms 重复率正好踩中，60 次只检出 1 次。
             // 60fps 帧长 16.7ms 短于任何系统重复率，不受影响。
-            let keys = (effect as? KeyPulseEffect)?.repeatStats.map { s -> String in
+            let keys = (effect as? PulseEffect)?.repeatStats.map { s -> String in
                 let seen = s.accepted + s.suppressed
                 let miss = opts.sequenceCount > 0 && seen < opts.sequenceCount
                     ? String(format: "  ❌ 只检出 %d/%d", seen, opts.sequenceCount) : ""

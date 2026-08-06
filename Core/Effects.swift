@@ -1,5 +1,4 @@
 import Foundation
-import CoreGraphics
 
 struct FrameContext {
     let time: TimeInterval      // 效果开始至今（秒）
@@ -137,57 +136,24 @@ final class StrobeEffect: Effect {
     }
 }
 
-// MARK: - 按键脉冲
+// MARK: - 脉冲效果（按键 / 鼓点共用）
 //
 // 「按下某个键，光以它为中心向四周扩散」做不到，也不要再试：
 // 全部 LED 共用一路 PWM，`setBrightness:forKeyboard:` 一块键盘只收一个 float
 // （Driver.swift）。没有分区、没有单键地址，扩散所需的空间维度根本不存在。
 //
-// 能做的是它在时间域上的等价物：敲键的瞬间整块键盘冲亮，然后衰减回底色。
+// 能做的是它在时间域上的等价物：事件发生的瞬间整块键盘冲亮，然后衰减回底色。
 //
-// **不需要输入监控权限。** `CGEventSource.secondsSinceLastEventType` 是公开 API，
-// 只返回「距上次按键多少秒」，不给按键内容，不弹授权框——IdleMonitor 早就在用
-// 同一个调用做空闲检测。代价是拿不到「按了哪个键」，
-// 而硬件本来就只有一个全局亮度寄存器，这个信息也无处可用。限制和需求正好抵消。
-
-/// 距上次按键的秒数。参数是效果时间轴上的当前时刻：
-/// 系统实现用不到，合成实现（`--analyze` 需要确定性输入）需要。
-///
-/// 做成注入而非在效果里直接调 CGEventSource，是为了让 `--analyze` 能跑真正的
-/// `KeyPulseEffect`——分析工具一旦另写一份曲线，就会开始骗人。
-typealias KeyPressClock = (TimeInterval) -> TimeInterval
-
-enum KeyPress {
-    /// 真实按键。无需任何授权。
-    static let system: KeyPressClock = { _ in
-        CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown)
-    }
-
-    /// 合成：t=0 敲一次，此后一直空闲。
-    static let synthetic: KeyPressClock = { t in t }
-
-    /// 合成：按给定时刻表敲键。自动重复、快速打字这类序列都由它喂给分析器。
-    ///
-    /// 第一次按下之前返回一个随 t 递增的大数——保证不产生下降沿，
-    /// 也就不会被误判成「刚刚按了一下」。
-    static func scripted(_ times: [TimeInterval]) -> KeyPressClock {
-        let sorted = times.sorted()
-        return { t in
-            // 最后一个不晚于 t 的按下时刻
-            var lo = 0, hi = sorted.count
-            while lo < hi {
-                let mid = (lo + hi) / 2
-                if sorted[mid] <= t { lo = mid + 1 } else { hi = mid }
-            }
-            return lo == 0 ? t + 1_000 : t - sorted[lo - 1]
-        }
-    }
-}
+// 「事件」从哪来由 `PulseSource` 决定（Core/PulseSource.swift）——敲键、鼓点、
+// 将来的 CLI 触发，对包络来说没有区别，都只是「多久之前发生了一次、有多强」。
+// 拆成「源 + 包络」的唯一理由就是这个：下面那条曲线是拿 255 档硬件地板反复磨出来的
+// （见文件开头 gamma 一节和 `envelope` 的注释），复制第二份出来必然漂移，
+// 而漂移了没人会发现——观感差异要盯着键盘看很久才察觉得到。
 
 /// 自动重复过滤器。
 ///
 /// 按住一个键时内核按固定周期重复投递 keyDown（首次延迟约 0.4s，之后约 0.1s，
-/// 两者都能在系统设置里调，重复间隔最快约 33ms）。`KeyPulseEffect` 对尚未衰减完的
+/// 两者都能在系统设置里调，重复间隔最快约 33ms）。`PulseEffect` 对尚未衰减完的
 /// 包络取 max，0.4s 的脉冲撞上 0.1s 的重复率，任一时刻都有约 4 个包络在叠，
 /// 最新那个永远刚过起手峰——幅度被钉在 0.79–1.0 之间以约 11Hz 抖动，
 /// 按住多久就亮多久。这不是 Delete 特有的，按住任何键都一样。
@@ -250,26 +216,37 @@ struct KeyRepeatFilter {
     }
 }
 
-/// 按键脉冲：每次敲键，整块键盘从 lo 冲到 hi 再衰减回 lo。
+/// 脉冲：每收到一次脉冲，整块键盘从 lo 冲到峰值再衰减回 lo。
 ///
 /// 包络形状受 255 档硬件地板约束（见本文件开头的 gamma 讨论）：
 ///   - attack 必须短到感觉不出延迟，但别短到只剩一帧，否则上升沿画不出来
 ///   - decay 用幂函数而不是指数：指数永远到不了 0，截断时会留下一个可见的台阶
-final class KeyPulseEffect: Effect {
-    let name = "keypulse"
+///
+/// 改这条曲线之前先跑 `--analyze`。0.4s / 0.05…0.85 的基准是：
+/// 409 次档位切换、档位 13–217、利用率 80.1%、最长单档停留 10.8ms。
+/// 最长停留一旦逼近 100ms 就是肉眼可见的卡顿。
+final class PulseEffect: Effect {
+    let name: String
     let motionIntent = MotionIntent.punctuated
 
     private let attack: Double
     private let decay: Double
     private let lo: Float
     private let hi: Float
-    private let clock: KeyPressClock
+    private let source: PulseSource
 
-    /// 仍在衰减中的按键时刻（效果时间轴）。连打时各自的包络取 max 叠成波浪。
-    private var presses: [Double] = []
-    private var lastIdle = Double.infinity
+    /// 合成源没有自己的时钟，得靠这里把效果时间推给它；真实源（键盘/音频）为 nil。
+    private let timed: TimedPulseSource?
+
+    /// 仍在衰减中的脉冲：效果时间轴上的发生时刻 + 强度。
+    /// 连打时各自的包络取 max 叠成波浪。
+    private var live: [(at: Double, strength: Float)] = []
 
     /// 长按时把自动重复挡在包络层之前。常开，`--no-repeat-filter` 只为真机 A/B 对比。
+    ///
+    /// ⚠️ 这是**键盘专用**的防御：判据是「连续两个间隔几乎相等」，
+    /// 而音乐的鼓点恰恰就是相等间隔——给节拍源建 `PulseEffect` 必须传 false，
+    /// 否则一首 120BPM 的歌前三拍之后就再也不闪了。
     private var repeats: KeyRepeatFilter?
 
     /// 诊断出口，`--analyze` 用来数误抑制。nil = 没开过滤。
@@ -279,9 +256,13 @@ final class KeyPulseEffect: Effect {
 
     private static let maxConcurrent = 16
 
-    /// - Parameter duration: 单次脉冲的总时长（attack + decay）
+    /// - Parameters:
+    ///   - duration: 单次脉冲的总时长（attack + decay）
+    ///   - source: 脉冲从哪来。键盘、鼓点、合成时刻表共用下面这一份包络
+    ///   - filterRepeats: 键盘自动重复过滤，见 `repeats`。非键盘源必须关掉
+    ///   - name: 只用于日志与 `--analyze` 的抬头。键盘脉冲传 "keypulse"
     init(duration: Double, min lo: Float, max hi: Float,
-         clock: @escaping KeyPressClock, filterRepeats: Bool = true) {
+         source: PulseSource, filterRepeats: Bool = true, name: String = "pulse") {
         let d = Swift.max(duration, 0.1)
         self.repeats = filterRepeats ? KeyRepeatFilter() : nil
         // 40ms 起手：60fps 下约 2.4 帧，够画出上升沿，加上最多一帧的检测延迟
@@ -290,41 +271,45 @@ final class KeyPulseEffect: Effect {
         self.decay = d - self.attack
         self.lo = lo
         self.hi = hi
-        self.clock = clock
+        self.source = source
+        self.timed = source as? TimedPulseSource
+        self.name = name
     }
 
     func tick(_ ctx: FrameContext) -> Float? {
-        let idle = clock(ctx.time)
+        // 合成源要先知道「现在几点」才知道有哪些脉冲到期了，见 TimedPulseSource。
+        timed?.advance(to: ctx.time)
 
-        // 空闲时间回落 = 上一帧之后有新按键。
-        // 同一帧内按下多个键只记一次——相隔 16ms 的两次脉冲本来也分辨不出。
-        // 下降沿 = 上一帧之后有新按键。
-        //
-        // ⚠️ 已知盲区（v0.1 就有，不是过滤器引入的）：当重复间隔比帧长**稍短**时，
-        // idle 每帧递增（增量 = 帧长 − 间隔），下降沿永远不出现，按键全被漏掉。
-        // 30fps（33.3ms）撞上系统最快重复率（33ms）正好踩中：实测 60 次只检出 1 次。
-        // 60fps 帧长 16.7ms 短于任何系统重复率，不受影响，所以默认配置安全。
-        // 根治要换掉判据——`CGEventSource.counterForEventType` 是单调计数，
-        // 同样免权限，能数出每帧发生了几次按下，配合 idle 取最近一次的亚帧时刻
-        // 信息严格多于现在。见 CLAUDE.md 后续工作。
-        if idle < lastIdle {
-            // 减 idle 而不是直接用 ctx.time：按下的瞬间落在帧与帧之间，
-            // 这样上升沿的起点是亚帧精度的，不会被量化到帧边界。
-            // 节奏判定同样吃这个亚帧精度——量化到帧边界的话，
-            // 16.7ms 的量化噪声会盖过内核 1ms 量级的抖动，规整度就无从谈起。
-            let at = ctx.time - idle
-            if repeats?.accept(pressedAt: at) ?? true {
-                presses.append(at)
-                if presses.count > Self.maxConcurrent { presses.removeFirst() }
-            }
+        // drain 取走的是**增量**，语义上不可能漏。这里不再有「相对上一帧回落」
+        // 那种判据，也就不再有它的盲区（事件间隔比帧长稍短时下降沿永不出现，
+        // 30fps 撞上 33ms 重复率实测 60 次只检出 1 次）。见 PulseSource.swift。
+        for pulse in source.drain() {
+            // 用「多久之前」换算回效果时间轴，而不是直接拿 ctx.time 当发生时刻：
+            // 敲击/鼓点落在帧与帧之间，减掉 secondsAgo 后上升沿起点才是亚帧精度的
+            // （实测采样峰值 0.844 vs 量化到帧边界的 0.815）。
+            // 节奏判定同样吃这个精度——量化到帧边界的话，16.7ms 的量化噪声
+            // 会盖过内核 1ms 量级的抖动，规整度就无从谈起。
+            let at = ctx.time - pulse.secondsAgo
+            guard repeats?.accept(pressedAt: at) ?? true else { continue }
+            // 这里假定 drain 返回的是按时间递增的。万一不是，`KeyRepeatFilter`
+            // 见到非正间隔会自己清空节奏历史（不会拿负间隔去比），包络取 max
+            // 更是与顺序无关，所以最坏情况只是少抑制一次，不会算错。
+            live.append((at, Swift.min(Swift.max(pulse.strength, 0), 1)))
+            if live.count > Self.maxConcurrent { live.removeFirst() }
         }
-        lastIdle = idle
 
         let span = attack + decay
-        presses.removeAll { ctx.time - $0 > span }
+        live.removeAll { ctx.time - $0.at > span }
 
+        // strength 乘在**单个脉冲的包络上、取 max 之前**：
+        //   ① 逐个乘才有意义——放到 max 外面等于让弱鼓点蹭上重鼓点的幅度；
+        //   ② 乘的是包络的**幅度**不是时间轴。缩时间轴会连带改衰减时长，
+        //      而 255 档下的停留分布是照现在这个形状调出来的，一动就得重跑 --analyze；
+        //   ③ 乘在 lo…hi 的插值系数上，弱脉冲收敛回 lo（静息亮度）而不是 0——
+        //      将来叠在呼吸底色上时才不会把底色打穿。
+        // 键盘源恒为 1.0，而 IEEE-754 下 1.0 × x 精确等于 x，按键行为逐位不变。
         var amp: Float = 0
-        for p in presses { amp = Swift.max(amp, envelope(ctx.time - p)) }
+        for p in live { amp = Swift.max(amp, p.strength * envelope(ctx.time - p.at)) }
         return lo + (hi - lo) * amp
     }
 

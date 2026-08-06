@@ -9,7 +9,8 @@ APP     := MagicKey
 BUNDLE  := $(APP).app
 CONTENTS:= $(BUNDLE)/Contents
 
-CORE    := ../Core/Log.swift ../Core/Driver.swift ../Core/StateGuard.swift ../Core/Effects.swift
+CORE    := ../Core/Log.swift ../Core/Driver.swift ../Core/StateGuard.swift ../Core/Effects.swift \
+           ../Core/PulseSource.swift ../Core/AudioActivity.swift ../Core/AudioTap.swift ../Core/OnsetDetector.swift ../Core/BeatPulseSource.swift
 SOURCES := $(CORE) $(wildcard Sources/*.swift)
 
 SWIFTC  := swiftc

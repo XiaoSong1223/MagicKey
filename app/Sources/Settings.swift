@@ -7,6 +7,7 @@ enum EffectKind: String, CaseIterable, Identifiable {
     case heartbeat
     case strobe
     case keyPulse = "keypulse"
+    case audioBeat = "audiobeat"
 
     var id: String { rawValue }
 
@@ -17,6 +18,7 @@ enum EffectKind: String, CaseIterable, Identifiable {
         case .heartbeat:   return "心跳"
         case .strobe:      return "频闪"
         case .keyPulse:    return "按键"
+        case .audioBeat:   return "音乐"
         }
     }
 
@@ -27,6 +29,7 @@ enum EffectKind: String, CaseIterable, Identifiable {
         case .heartbeat:   return "heart"
         case .strobe:      return "bolt"
         case .keyPulse:    return "hand.tap"
+        case .audioBeat:   return "waveform"
         }
     }
 
@@ -38,6 +41,7 @@ enum EffectKind: String, CaseIterable, Identifiable {
         case .heartbeat:   return 0.6...3
         case .strobe:      return 0.1...2
         case .keyPulse:    return 0.15...1.5
+        case .audioBeat:   return 0.15...1.5
         }
     }
 
@@ -48,17 +52,18 @@ enum EffectKind: String, CaseIterable, Identifiable {
         case .heartbeat:   return 1.2
         case .strobe:      return 0.5
         case .keyPulse:    return 0.4
+        case .audioBeat:   return 0.35
         }
     }
 
     /// 按键脉冲不循环，「周期」这个词对它是错的
     var periodLabel: String {
-        self == .keyPulse ? "脉冲时长" : "周期"
+        self == .keyPulse || self == .audioBeat ? "脉冲时长" : "周期"
     }
 
     /// 最暗/最亮两个滑块在按键脉冲下的含义是「静息」和「峰值」
     var levelLabels: (lo: String, hi: String) {
-        self == .keyPulse ? ("静息亮度", "脉冲峰值") : ("最暗", "最亮")
+        self == .keyPulse || self == .audioBeat ? ("静息亮度", "脉冲峰值") : ("最暗", "最亮")
     }
 }
 
@@ -119,6 +124,17 @@ final class Settings: ObservableObject {
         didSet { Self.d.set(idleSeconds, forKey: "idleSeconds") }
     }
 
+    /// 音乐律动的触发灵敏度（`OnsetDetector` 的阈值倍数）。小 = 灵敏 = 闪得密。
+    ///
+    /// 直接推给已经在跑的检测器，**不重建效果、不重建 tap**——
+    /// tap 建立要 1.8–4.6 秒，拖滑块时重建等于卡死。
+    @Published var sensitivity: Double = Settings.double("sensitivity", 1.35) {
+        didSet {
+            Self.d.set(sensitivity, forKey: "sensitivity")
+            BeatPulseSource.shared.sensitivity = Float(sensitivity)
+        }
+    }
+
     var fps: Double { powerSaver ? 30 : 60 }
 
     func makeEffect() -> Effect {
@@ -127,8 +143,19 @@ final class Settings: ObservableObject {
         case .breathe:     return BreatheEffect(period: period, min: Float(lo), max: Float(hi))
         case .heartbeat:   return HeartbeatEffect(period: period, min: Float(lo), max: Float(hi))
         case .strobe:      return StrobeEffect(period: period, min: Float(lo), max: Float(hi))
-        case .keyPulse:    return KeyPulseEffect(duration: period, min: Float(lo), max: Float(hi),
-                                                 clock: KeyPress.system)
+        case .keyPulse:    return PulseEffect(duration: period, min: Float(lo), max: Float(hi),
+                                             source: KeyboardPulseSource(), name: "keypulse")
+        case .audioBeat:
+            // tap 的启停不在这里做生命周期管理：它比效果活得久（重建要几秒），
+            // 停止由「没人 drain 就自停」的看门狗负责。见 BeatPulseSource 类注释。
+            let src = BeatPulseSource.shared
+            src.sensitivity = Float(sensitivity)
+            src.activate()
+            // ⚠️ filterRepeats 必须为 false：`KeyRepeatFilter` 的判据是
+            // 「连续两个间隔几乎相等 = 自动重复」，而音乐的鼓点**本来就是等间隔**。
+            // 开着的话一首 120BPM 的歌前三拍之后就再也不闪了。
+            return PulseEffect(duration: period, min: Float(lo), max: Float(hi),
+                               source: src, filterRepeats: false, name: "audiobeat")
         }
     }
 }

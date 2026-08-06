@@ -13,3 +13,4 @@ DerivedData/
 .idea/
 *.xcuserstate
 xcuserdata/
+.claude/worktrees/

@@ -16,12 +16,22 @@
     <string>0.1</string>
     <key>CFBundleVersion</key>
     <string>1</string>
+    <!-- 保持 14.0：音频律动用的 Core Audio Process Tap 要 14.2，
+         但那只是一个效果。抬高这里会把 14.0/14.1 用户挡在整个 app 之外，
+         正确做法是代码里 if #available(macOS 14.2, *) 单独降级掉那个效果。 -->
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
 
     <!-- 菜单栏应用：不显示 Dock 图标，不进 App 切换器 -->
     <key>LSUIElement</key>
     <true/>
+
+    <!-- 音频律动（v0.3）用 Core Audio Process Tap 采集系统音频输出，
+         对应 TCC 的 kTCCServiceAudioCapture——系统设置里叫「系统录音」，
+         不是「麦克风」，别按麦克风那条去排查授权。
+         用户只在开启音频律动效果时才会看到这个授权框；拒绝后其余效果照常可用。 -->
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>MagicKey 需要读取系统正在播放的声音，才能让键盘背光跟着音乐明暗变化。音频只在内存中实时换算成一个用于控制亮度的能量包络（响度），随即丢弃：不录音、不写入磁盘、不联网上传，进程内也没有任何能还原出声音内容的代码路径。</string>
 
     <key>NSHumanReadableCopyright</key>
     <string>MagicKey · MIT License</string>

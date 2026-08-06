@@ -41,7 +41,16 @@ struct Options {
     /// 序列里一共有多少次按下——用来和效果实际检出的次数对照
     var sequenceCount = 0
 
-    enum Mode { case analyze, preview, set, probe }
+    /// 起音检测定参（`--probe-audio`）
+    var audioFile: String?      // 离线重放这个文件
+    var audioTruth: String?     // 标准答案 JSON
+    var audioDump: String?      // 包络时间序列导出到 CSV
+    var audioSweep = false      // 扫参而不是单跑
+    var audioLive = false       // 走真 AudioTap 而不是离线
+    var audioSeconds = 20.0
+    var onset = OnsetDetector.Params()
+
+    enum Mode { case analyze, preview, set, probe, probeAudio }
 }
 
 func parseArgs() -> Options {
@@ -65,6 +74,20 @@ func parseArgs() -> Options {
         case "--no-repeat-filter": o.repeatFilter = false
         case "--repeat-interval":  o.repeatInterval = (Double(val()) ?? 100) / 1000
         case "--repeat-jitter":    o.repeatJitter = (Double(val()) ?? 1) / 1000
+
+        case "--probe-audio":  o.mode = .probeAudio
+        case "--file":         o.audioFile = val()
+        case "--truth":        o.audioTruth = val()
+        case "--dump":         o.audioDump = val()
+        case "--sweep":        o.audioSweep = true
+        case "--live":         o.audioLive = true
+        case "--seconds":      o.audioSeconds = Double(val()) ?? o.audioSeconds
+        case "--cutoff":       o.onset.cutoffHz = Double(val()) ?? o.onset.cutoffHz
+        case "--threshold":    o.onset.threshold = Float(val()) ?? o.onset.threshold
+        case "--avg-ms":       o.onset.avgMs = Double(val()) ?? o.onset.avgMs
+        case "--refractory":   o.onset.refractoryMs = Double(val()) ?? o.onset.refractoryMs
+        case "--attack-ms":    o.onset.attackMs = Double(val()) ?? o.onset.attackMs
+        case "--release-ms":   o.onset.releaseMs = Double(val()) ?? o.onset.releaseMs
         case "-h", "--help":
             print("""
             用法: magickey-tool <模式> [选项]
@@ -111,6 +134,34 @@ if opts.mode == .probe {
     exit(0)
 }
 
+// MARK: - probe-audio：起音检测定参
+//
+// 离线（--file）不碰硬件也不需要授权，是定参的主力；
+// 实时（--live）走真正的 AudioTap，需要「系统录音」授权，只用来验证管线。
+
+if opts.mode == .probeAudio {
+    if opts.audioLive {
+        guard #available(macOS 14.2, *) else {
+            FileHandle.standardError.write(
+                "系统音频采集需要 macOS 14.2+（AudioHardwareCreateProcessTap）\n".data(using: .utf8)!)
+            exit(1)
+        }
+        AudioProbe.runLive(seconds: opts.audioSeconds,
+                           playFile: opts.audioFile, params: opts.onset)
+    } else {
+        guard let file = opts.audioFile else {
+            FileHandle.standardError.write(
+                "--probe-audio 需要 --file <音频文件>（离线），或 --live（走真实采集）\n"
+                    .data(using: .utf8)!)
+            exit(2)
+        }
+        AudioProbe.runOffline(file: file, truthPath: opts.audioTruth,
+                              sweep: opts.audioSweep, params: opts.onset,
+                              dump: opts.audioDump)
+    }
+    exit(0)
+}
+
 // keypulse 的 --period 语义是「单次脉冲时长」，4 秒的默认值对它毫无意义
 if !opts.periodExplicit && opts.effect == "keypulse" { opts.period = 0.4 }
 
@@ -141,12 +192,12 @@ func makeEffect(_ o: Options) -> Effect {
     case "keypulse":
         // preview 用真键盘；analyze 要确定性输入——给了序列就重放序列，
         // 没给就退回老的「t=0 敲一次」
-        let clock: KeyPressClock
-        if let times = pressTimes         { clock = KeyPress.scripted(times) }
-        else if o.mode == .analyze        { clock = KeyPress.synthetic }
-        else                              { clock = KeyPress.system }
-        return KeyPulseEffect(duration: o.period, min: o.lo, max: o.hi,
-                              clock: clock, filterRepeats: o.repeatFilter)
+        let source: PulseSource
+        if let times = pressTimes         { source = SyntheticPulseSource(times: times) }
+        else if o.mode == .analyze        { source = SyntheticPulseSource() }
+        else                              { source = KeyboardPulseSource() }
+        return PulseEffect(duration: o.period, min: o.lo, max: o.hi,
+                           source: source, filterRepeats: o.repeatFilter, name: "keypulse")
     default:          return BreatheEffect(period: o.period, min: o.lo, max: o.hi)
     }
 }
