@@ -164,8 +164,90 @@ enum KeyPress {
     }
 
     /// 合成：t=0 敲一次，此后一直空闲。
-    /// 分析器会把 t 从 0 重放好几轮（每个候选帧率一轮），每轮都会重新触发，正合用。
     static let synthetic: KeyPressClock = { t in t }
+
+    /// 合成：按给定时刻表敲键。自动重复、快速打字这类序列都由它喂给分析器。
+    ///
+    /// 第一次按下之前返回一个随 t 递增的大数——保证不产生下降沿，
+    /// 也就不会被误判成「刚刚按了一下」。
+    static func scripted(_ times: [TimeInterval]) -> KeyPressClock {
+        let sorted = times.sorted()
+        return { t in
+            // 最后一个不晚于 t 的按下时刻
+            var lo = 0, hi = sorted.count
+            while lo < hi {
+                let mid = (lo + hi) / 2
+                if sorted[mid] <= t { lo = mid + 1 } else { hi = mid }
+            }
+            return lo == 0 ? t + 1_000 : t - sorted[lo - 1]
+        }
+    }
+}
+
+/// 自动重复过滤器。
+///
+/// 按住一个键时内核按固定周期重复投递 keyDown（首次延迟约 0.4s，之后约 0.1s，
+/// 两者都能在系统设置里调，重复间隔最快约 33ms）。`KeyPulseEffect` 对尚未衰减完的
+/// 包络取 max，0.4s 的脉冲撞上 0.1s 的重复率，任一时刻都有约 4 个包络在叠，
+/// 最新那个永远刚过起手峰——幅度被钉在 0.79–1.0 之间以约 11Hz 抖动，
+/// 按住多久就亮多久。这不是 Delete 特有的，按住任何键都一样。
+///
+/// 判据是**节奏规整度**，不是间隔长短：内核定时器的抖动在 1ms 量级，
+/// 人类打字的抖动在几十 ms，连续两个间隔几乎完全相等是人产生不出来的。
+/// 因此不依赖用户的重复速率设置（33ms–2s 全覆盖），也兼容 Karabiner
+/// 之类自己产生重复的改键工具，更不需要读任何系统偏好。
+///
+/// 代价是锁定需要看见两个相等的间隔——真实按下之后还会放过两次重复
+/// （默认设置下开头约 0.5s 的活动），之后按住多久都彻底安静。
+/// 松手后的下一次按键间隔必然对不上，自动解除，不需要超时逻辑。
+struct KeyRepeatFilter {
+
+    /// 容差。**刻意是绝对值，不带相对项**——实测（`--probe`）表明相对项的缩放方向
+    /// 正好是反的：自动重复间隔（本机 83.5ms）比人类打字间隔（150–200ms）**短**，
+    /// 按比例给容差等于在人手那一侧放得更宽，误抑制不降反升。
+    var tolerance: TimeInterval = 0.004
+
+    /// 需要连续多少个「与前一个几乎相等」的间隔才锁定。
+    /// 1 = 看到两个相等的间隔就抑制——实测误抑制率过高，人类打字里
+    /// 偶尔就能凑出一对相差 2–3ms 的相邻间隔。要求连续两次则概率是平方级下降，
+    /// 代价只是每次长按多放行一次重复（本机约 84ms）。
+    var lockAfter = 2
+
+    /// 纯诊断计数，给 `--analyze` 用。占空比看不出误抑制——被吞掉的那次按键
+    /// 多半正落在前一次的包络里，曲线几乎不动，只有直接数才数得出来。
+    private(set) var accepted = 0
+    private(set) var suppressed = 0
+
+    private var lastPress: TimeInterval?
+    private var lastInterval: TimeInterval?
+    private var matchRun = 0
+
+    /// - Returns: true 表示这次按下应当触发脉冲
+    mutating func accept(pressedAt t: TimeInterval) -> Bool {
+        guard let prev = lastPress else {
+            lastPress = t
+            accepted += 1
+            return true
+        }
+        let interval = t - prev
+        lastPress = t
+
+        // 时间轴回绕或乱序：清空节奏历史重新起算，绝不拿负间隔去比
+        guard interval > 0 else {
+            lastInterval = nil
+            matchRun = 0
+            accepted += 1
+            return true
+        }
+
+        let matches = lastInterval.map { abs(interval - $0) <= tolerance } ?? false
+        matchRun = matches ? matchRun + 1 : 0
+        lastInterval = interval
+
+        let repeated = matchRun >= lockAfter
+        if repeated { suppressed += 1 } else { accepted += 1 }
+        return !repeated
+    }
 }
 
 /// 按键脉冲：每次敲键，整块键盘从 lo 冲到 hi 再衰减回 lo。
@@ -187,11 +269,21 @@ final class KeyPulseEffect: Effect {
     private var presses: [Double] = []
     private var lastIdle = Double.infinity
 
+    /// 长按时把自动重复挡在包络层之前。常开，`--no-repeat-filter` 只为真机 A/B 对比。
+    private var repeats: KeyRepeatFilter?
+
+    /// 诊断出口，`--analyze` 用来数误抑制。nil = 没开过滤。
+    var repeatStats: (accepted: Int, suppressed: Int)? {
+        repeats.map { ($0.accepted, $0.suppressed) }
+    }
+
     private static let maxConcurrent = 16
 
     /// - Parameter duration: 单次脉冲的总时长（attack + decay）
-    init(duration: Double, min lo: Float, max hi: Float, clock: @escaping KeyPressClock) {
+    init(duration: Double, min lo: Float, max hi: Float,
+         clock: @escaping KeyPressClock, filterRepeats: Bool = true) {
         let d = Swift.max(duration, 0.1)
+        self.repeats = filterRepeats ? KeyRepeatFilter() : nil
         // 40ms 起手：60fps 下约 2.4 帧，够画出上升沿，加上最多一帧的检测延迟
         // 仍在「和敲击同时发生」的感知范围内。
         self.attack = Swift.min(0.04, d * 0.2)
@@ -206,11 +298,25 @@ final class KeyPulseEffect: Effect {
 
         // 空闲时间回落 = 上一帧之后有新按键。
         // 同一帧内按下多个键只记一次——相隔 16ms 的两次脉冲本来也分辨不出。
+        // 下降沿 = 上一帧之后有新按键。
+        //
+        // ⚠️ 已知盲区（v0.1 就有，不是过滤器引入的）：当重复间隔比帧长**稍短**时，
+        // idle 每帧递增（增量 = 帧长 − 间隔），下降沿永远不出现，按键全被漏掉。
+        // 30fps（33.3ms）撞上系统最快重复率（33ms）正好踩中：实测 60 次只检出 1 次。
+        // 60fps 帧长 16.7ms 短于任何系统重复率，不受影响，所以默认配置安全。
+        // 根治要换掉判据——`CGEventSource.counterForEventType` 是单调计数，
+        // 同样免权限，能数出每帧发生了几次按下，配合 idle 取最近一次的亚帧时刻
+        // 信息严格多于现在。见 CLAUDE.md 后续工作。
         if idle < lastIdle {
             // 减 idle 而不是直接用 ctx.time：按下的瞬间落在帧与帧之间，
             // 这样上升沿的起点是亚帧精度的，不会被量化到帧边界。
-            presses.append(ctx.time - idle)
-            if presses.count > Self.maxConcurrent { presses.removeFirst() }
+            // 节奏判定同样吃这个亚帧精度——量化到帧边界的话，
+            // 16.7ms 的量化噪声会盖过内核 1ms 量级的抖动，规整度就无从谈起。
+            let at = ctx.time - idle
+            if repeats?.accept(pressedAt: at) ?? true {
+                presses.append(at)
+                if presses.count > Self.maxConcurrent { presses.removeFirst() }
+            }
         }
         lastIdle = idle
 

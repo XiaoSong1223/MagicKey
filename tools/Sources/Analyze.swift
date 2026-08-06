@@ -23,13 +23,21 @@ enum Analyzer {
         let level: Int
     }
 
-    static func run(effect: Effect, opts: Options) {
-        let period = opts.period
+    /// 收的是**工厂**而不是实例：分析要把 t 从 0 重放五轮（20kHz 一轮 + 每个候选
+    /// 帧率一轮），而 `KeyPulseEffect` 这类效果是有状态的，状态跨轮次带过去
+    /// 会让后面几轮跑在被前一轮污染过的状态上（节奏历史里甚至会出现负间隔）。
+    /// 每轮现造一个，才是在分析「效果」而不是「效果的某次历史」。
+    static func run(make: () -> Effect, opts: Options) {
+        let window = opts.window
+        let effect = make()
+        // 时间轴有周期性时才谈得上「上升段/下降段」；喂了按键序列就没有相位可言
+        let periodic = opts.sequence == nil
+
         var segments: [Segment] = []
         var lastLevel = -1
         var segStart = 0.0
 
-        let n = Int(period * sampleHz)
+        let n = Int(window * sampleHz)
         for i in 0...n {
             let t = Double(i) / sampleHz
             let ctx = FrameContext(time: t, frame: UInt64(i), base: opts.hi)
@@ -46,11 +54,11 @@ enum Analyzer {
             }
         }
         if lastLevel >= 0 {
-            segments.append(Segment(start: segStart, dwell: period - segStart, level: lastLevel))
+            segments.append(Segment(start: segStart, dwell: window - segStart, level: lastLevel))
         }
 
         guard segments.count > 1 else {
-            print("效果 \(effect.name) 在一个周期内只有 1 个档位（静态），无需分析。")
+            print("效果 \(effect.name) 在整个窗口内只有 1 个档位（静态），无需分析。")
             return
         }
 
@@ -66,12 +74,14 @@ enum Analyzer {
 
         ══════════ 效果曲线分析 ══════════
         效果            \(effect.name)
-        周期            \(period) s
+        周期            \(opts.period) s
+        分析窗口        \(String(format: "%.2f", window)) s
+        按键序列        \(opts.sequence ?? "—")\(opts.repeatFilter ? "" : "（已关闭自动重复过滤）")
         亮度范围        \(opts.lo) … \(opts.hi)
         gamma           \(opts.gamma)\(opts.gamma == 1.0 ? " (关闭)" : "")
 
         ── 档位使用 ──────────────────────
-        档位切换次数    \(segments.count) / 周期
+        档位切换次数    \(segments.count) / 窗口
         实际档位范围    \(levels.min()!) – \(levels.max()!) / 255
         可用档位利用率  \(String(format: "%.1f", Double(Set(levels).count) / 256 * 100)) %
 
@@ -100,15 +110,14 @@ enum Analyzer {
             print(punctuated ? "\(stalls.count) 处 >\(Int(stallThreshold * 1000))ms 的保持段（可能是设计内的）："
                              : "⚠️  \(stalls.count) 处可察觉卡顿：")
             for s in stalls.prefix(5) {
-                let phase = s.start / period
-                let where_ = phase < 0.5 ? "上升段" : "下降段"
+                let where_ = periodic ? (s.start / window < 0.5 ? "上升段" : "下降段") : "—"
                 print(String(format: "   t=%5.2fs (%@)  档位 %3d  停留 %5.1f ms",
                              s.start, where_, s.level, s.dwell * 1000))
             }
             if stalls.count > 5 { print("   …还有 \(stalls.count - 5) 处") }
             if levels.contains(0) {
                 let off = segments.filter { $0.level == 0 }.map(\.dwell).reduce(0, +)
-                print(String(format: "   ⚠️  每周期完全熄灭 %.0f ms", off * 1000))
+                print(String(format: "   ⚠️  窗口内完全熄灭 %.0f ms", off * 1000))
             }
         }
 
@@ -122,17 +131,31 @@ enum Analyzer {
         print("\n── 帧率需求 ────────────────────")
         print(String(format: "档位切换最快处   %.1f ms/档（= %.0f fps 才能不丢档，仅供参考）",
                      minDwell * 1000, ceil(1.0 / minDwell)))
-        print("\n   fps   最大相对步进   出现位置    评价")
+
+        // 「点亮占空比」＝窗口内亮度高于静息 10% 的时间比例。
+        //
+        // 加这一列是为了回答一个最大相对步进答不了的问题：**判定器有没有锁上**。
+        // 按键检测是逐帧比对、一帧只记一次（Effects.swift），30fps 帧长 33ms 而
+        // 重复间隔最快约 33ms——两次重复会落进同一帧，测出的间隔忽 33 忽 66，
+        // 规整度被采样破坏，长按就抑制不住。那种失效在这一列上是一眼的：
+        // 长按序列下占空比应该很低（只有开头那几下），失效则接近 100%。
+        let litThreshold = opts.lo + 0.1 * (opts.hi - opts.lo)
+        print("\n   fps   最大相对步进   出现位置    点亮占空比   评价")
 
         for fps in [30.0, 60.0, 90.0, 120.0] {
+            // 每个帧率现造一个：见 run(make:) 的说明
+            let effect = make()
             var worstRel = 0.0
             var worstAt = 0
             var worstJump = 0
             var prev = -1
-            for i in 0..<Int(period * fps) {
+            var lit = 0, total = 0
+            for i in 0..<Int(window * fps) {
                 let t = Double(i) / fps
                 let ctx = FrameContext(time: t, frame: UInt64(i), base: opts.hi)
                 guard let p = effect.tick(ctx) else { continue }
+                total += 1
+                if p > litThreshold { lit += 1 }
                 let level = Int((min(max(Perceptual.toPhysical(p, gamma: opts.gamma), 0), 1) * 255).rounded())
                 if prev >= 0 {
                     let jump = abs(level - prev)
@@ -152,8 +175,21 @@ enum Analyzer {
                 default:       verdict = "❌ 可见跳变"
                 }
             }
-            print(String(format: "  %4.0f      %6.1f %%      档%3d 跳%2d    %@",
-                         fps, worstRel * 100, worstAt, worstJump, verdict))
+            let duty = total > 0 ? Double(lit) / Double(total) * 100 : 0
+            // 检出数（触发+抑制）少于序列长度 = 有按键根本没被看见。
+            //
+            // 这不是过滤器的问题，是检测本身的盲区：判据是 idle 相对上一帧回落，
+            // 而当重复间隔比帧长**稍短**时，idle 每帧递增（增量 = 帧长 − 间隔），
+            // 下降沿永远不出现。30fps + 33ms 重复率正好踩中，60 次只检出 1 次。
+            // 60fps 帧长 16.7ms 短于任何系统重复率，不受影响。
+            let keys = (effect as? KeyPulseEffect)?.repeatStats.map { s -> String in
+                let seen = s.accepted + s.suppressed
+                let miss = opts.sequenceCount > 0 && seen < opts.sequenceCount
+                    ? String(format: "  ❌ 只检出 %d/%d", seen, opts.sequenceCount) : ""
+                return String(format: "  %3d 触发 / %3d 抑制%@", s.accepted, s.suppressed, miss)
+            } ?? ""
+            print(String(format: "  %4.0f      %6.1f %%      档%3d 跳%2d      %5.1f %%    %@%@",
+                         fps, worstRel * 100, worstAt, worstJump, duty, verdict, keys))
         }
         print("""
 
