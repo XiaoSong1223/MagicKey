@@ -260,6 +260,58 @@ cd tools && make preview     # 真实键盘预览，Ctrl-C 还原
 让渲染队列直接读写 `@MainActor` 的 `Engine` 属性是数据竞争，
 `-swift-version 5` 下编译器不拦但它是真的错。
 
+**`MenuBarExtra` 的面板窗口只涨不缩，所以面板改用自己管的 `NSStatusItem + NSPopover`。**
+展开「高级」把窗口撑到 717pt 之后，收回、切换效果、**关掉重新打开**都停在 717，
+下面留一大片空白。不是布局写法的问题：不套 ScrollView 的对照组一样卡在 1373，
+`.id()` 强制重建也无效。同一棵视图树放进 `NSPopover` 是双向跟随的（717→473→326）。
+代价只是 AppDelegate 里多四十行（`@main` 从 SwiftUI `App` 换成裸 `NSApplication`，
+注意 `NSApplication.delegate` 是**弱引用**，必须自己留强引用）。
+
+**全屏时状态栏按钮的锚点会失效，有两种失效方式，只防住一种等于没防。**
+
+- **① 挪出所有屏幕**：`button.window?.screen == nil`，锚点矩形 y=1114.5 而两块屏最高才 1080。
+  面板被 `NSPopover` 摆到主屏原点，还被屏幕边缘裁掉。
+- **② 停在另一块屏上**：外接屏全屏时按钮窗口留在**内建屏**，
+  「锚点在某块屏幕上」这个检查照样通过 → 面板开到左边那块屏去了。
+  内建屏全屏时按钮和指针同屏，所以只在外接屏上复现——**别因为内建屏正常就以为修好了**。
+
+所以判据不是「锚点在不在屏幕上」，而是「**在不在用户刚点的那块屏上**」：
+拿 `NSEvent.mouseLocation` 所在屏当基准（刚点完图标，指针就停在图标上），
+按钮矩形不落在这块屏上就走鼠标兜底。`show(relativeTo:of:)` 只认视图不收裸矩形，
+退路要备一个透明小窗口当锚，`level = .statusBar` +
+`collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]`，否则它进不了全屏空间。
+普通 Space 的锚点 y 可以用 `screen.visibleFrame.maxY`，但全屏 Space 里
+`visibleFrame == frame`：直接取 `maxY` 会让 2pt 锚点整个落在屏幕外，
+`anchorWindow.screen == nil`，结果 `NSPopover` 被约束回左边的主屏。要同时用
+状态栏窗口高度补回全屏时丢掉的上边距（`NSStatusBar.system.thickness`
+只做保底，本机返回 22pt，而刘海屏/外接屏的实际菜单栏分别是 33/30pt）。
+
+**面板展开时「所有内容跳一下」，是两个动画在打架。** 逐帧采样发现面板窗口是
+**一帧之内**从 473 snap 到 717 的（中间无过渡帧，窗口上沿始终不动），
+而 `DisclosureGroup` 自带的展开动画要花几帧滑动**布局**——两者错开一拍就是那一下跳。
+解法不是把动画调慢或调快，是**让布局和窗口同一帧到位，只 animate 不参与布局的属性**：
+自己搭展开控件，新内容用 `.transition(.opacity)` 淡入，箭头用 `rotationEffect`。
+判据很硬：改完再采样，t=0 就是终值且此后不变。
+
+**面板高度的三个坑，是同一个问题的三种表现：**
+
+1. **别「量内容高度再反过来设自己的 frame」**——循环依赖：`@State` 初值 0 →
+   `.frame(height: max(0,1))` → 面板 1pt → 量出来还是 0，**永远停在 360×1**。
+2. **别把上限拍脑袋写死**。写死 620 时比展开后的真实内容（音乐律动 717pt）还矮，
+   于是一展开就进滚动态、头尾被滚出视野。上限要按 `NSScreen.visibleFrame` 算。
+3. **正解**：`ScrollView { … }.frame(width:).frame(maxHeight:).fixedSize(horizontal: false, vertical: true)`。
+   ScrollView 在滚动轴上默认**贪心**（给多少占多少，内容不足时底部留一大片空白），
+   `fixedSize` 让它改取内容理想高，`maxHeight` 封顶，超限时自动恢复滚动。
+
+实测各效果面板高：常亮 326/457、呼吸心跳频闪 390/634、按键脉冲 409/653、
+音乐律动 473/717（折叠/展开）。**加新控件前先对着这组数看会不会顶到屏幕上限。**
+
+> 量这些数不需要人工点击：`NSStatusItem.button` 上 `performClick(nil)` 就能程序化
+> 打开面板，再读 `NSPopover.contentViewController.view.frame` 和内部 `NSScrollView` 的
+> `documentView` / `contentView` 高度差，就知道有没有溢出。探针里把 `Engine` 换成
+> 同接口的桩（面板只用到 `available`/`status`/`isRunning` 三个属性），
+> 就不必引入 `Driver`/`StateGuard`，也不会动到正在运行的那个实例的崩溃恢复状态。
+
 **「丢档比例」不是感知指标。** 判据是最大**相对**亮度步进（韦伯定律）。
 高亮度区跳 3 档只有 2% 变化看不出来，档位 2 附近跳 3 档是 150% 一眼可见。
 

@@ -1,6 +1,10 @@
 import Foundation
 import Combine
 
+private extension Double {
+    func clamped(_ lo: Double, _ hi: Double) -> Double { Swift.min(Swift.max(self, lo), hi) }
+}
+
 enum EffectKind: String, CaseIterable, Identifiable {
     case staticLevel = "static"
     case breathe
@@ -61,9 +65,24 @@ enum EffectKind: String, CaseIterable, Identifiable {
         self == .keyPulse || self == .audioBeat ? "脉冲时长" : "周期"
     }
 
-    /// 最暗/最亮两个滑块在按键脉冲下的含义是「静息」和「峰值」
+    /// 最暗/最亮两个滑块在按键脉冲下的含义是「静息」和「峰值」。
+    /// 主界面只用 hi（叫「亮度」），lo 收在高级里，所以这里主要是 lo 的标签。
     var levelLabels: (lo: String, hi: String) {
         self == .keyPulse || self == .audioBeat ? ("静息亮度", "脉冲峰值") : ("最暗", "最亮")
+    }
+
+    /// 效果选中时的一句说明。**只写「做不到什么」**——
+    /// 硬件限制导致的落差会被当成 bug 报上来，先说清楚比事后解释便宜。
+    /// 其余效果不需要说明，返回 nil 就不占版面。
+    var note: String? {
+        switch self {
+        case .keyPulse:
+            return "每次敲键整块键盘闪一下。硬件只有一路全局背光，无法从单个按键扩散。"
+        case .audioBeat:
+            return "整块键盘跟着音乐的鼓点闪。需要「系统录音」权限（不是麦克风）。"
+        default:
+            return nil
+        }
     }
 }
 
@@ -132,6 +151,36 @@ final class Settings: ObservableObject {
         didSet {
             Self.d.set(sensitivity, forKey: "sensitivity")
             BeatPulseSource.shared.sensitivity = Float(sensitivity)
+        }
+    }
+
+    /// 自动检查更新。**这是 App 唯一的网络请求**，所以给了明确的开关——
+    /// DESIGN.md §5 的隐私红线要求网络行为可关闭。关掉之后进程不碰网络。
+    @Published var autoCheckUpdates: Bool = Settings.bool("autoCheckUpdates", true) {
+        didSet { Self.d.set(autoCheckUpdates, forKey: "autoCheckUpdates") }
+    }
+
+    /// 「高级」是否展开。持久化是因为它标记的是**用户类型**而不是一次操作——
+    /// 会展开的人下次还想看见，不该每次开菜单都重新折叠。
+    @Published var showAdvanced: Bool = Settings.bool("showAdvanced", false) {
+        didSet { Self.d.set(showAdvanced, forKey: "showAdvanced") }
+    }
+
+    /// 「快慢」滑块用的归一化速度：0 = 最慢，1 = 最快。
+    ///
+    /// 主界面不暴露「周期 4.0 秒」这种工程师语言。方向也是反的——
+    /// 周期越短越快，而滑块往右理应变快，所以这里做了翻转。
+    /// 各效果的周期区间不同（呼吸 1–20s，频闪 0.1–2s），归一化之后
+    /// 同一个滑块位置在不同效果下含义一致：都是「这个效果的最快/最慢」。
+    var speed: Double {
+        get {
+            let r = kind.periodRange
+            guard r.upperBound > r.lowerBound else { return 0.5 }
+            return (r.upperBound - period) / (r.upperBound - r.lowerBound)
+        }
+        set {
+            let r = kind.periodRange
+            period = r.upperBound - newValue.clamped(0, 1) * (r.upperBound - r.lowerBound)
         }
     }
 

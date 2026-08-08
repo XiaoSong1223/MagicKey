@@ -12,10 +12,13 @@
     <string>MagicKey</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <!-- 面板底部显示的就是这个字符串，同时是更新检查的比较基准
+         （UpdateChecker.isNewer(latest, than: current)）。**每次发版必须改**，
+         忘了改的话不但显示错版本，还会把仓库里已发布的版本判成「有新版本」。 -->
     <key>CFBundleShortVersionString</key>
-    <string>0.1</string>
+    <string>0.4</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>4</string>
     <!-- 保持 14.0：音频律动用的 Core Audio Process Tap 要 14.2，
          但那只是一个效果。抬高这里会把 14.0/14.1 用户挡在整个 app 之外，
          正确做法是代码里 if #available(macOS 14.2, *) 单独降级掉那个效果。 -->
