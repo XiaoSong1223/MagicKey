@@ -15,7 +15,21 @@ MagicKey 是一款轻量的 macOS 菜单栏工具，为 MacBook 内置键盘背�
 
 ## 安装
 
-当前版本从源码构建。需要先安装 Xcode Command Line Tools：
+### 下载发行包
+
+从 [Releases](https://github.com/XiaoSong1223/MagicKey/releases/latest) 下载 `MagicKey-<版本>.zip`，解压后把 `MagicKey.app` 拖进 `/Applications`。
+
+发行包只做了本地 ad-hoc 签名，未经 Developer ID 公证，首次打开会被 Gatekeeper 拦下。解除隔离属性后即可正常启动：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/MagicKey.app
+```
+
+也可以在“系统设置 → 隐私与安全性”中找到被拦截的提示并选择“仍要打开”。
+
+### 从源码构建
+
+需要先安装 Xcode Command Line Tools：
 
 ```bash
 xcode-select --install
@@ -35,7 +49,7 @@ make -C app uninstall
 卸载前请先在 MagicKey 中关闭“开机自动启动”。卸载命令只移除 `/Applications/MagicKey.app`，不会删除已有偏好设置。
 
 > [!NOTE]
-> 当前尚未提供 Homebrew cask，也未进行 Developer ID 公证。正式分发流程仍在完善中。
+> 当前尚未提供 Homebrew cask，发行包也未进行 Developer ID 公证。正式分发流程仍在完善中。
 
 ## 功能
 
