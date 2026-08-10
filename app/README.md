@@ -76,4 +76,3 @@ Sources/
 - CLI / URL Scheme 触发
 - 音频律动
 - 帧率按效果推导（当前固定 60 / 30）
-- 应用图标（现在用 SF Symbol `keyboard`）

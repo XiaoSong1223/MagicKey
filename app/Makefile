@@ -12,6 +12,9 @@ CONTENTS:= $(BUNDLE)/Contents
 CORE    := ../Core/Log.swift ../Core/Driver.swift ../Core/StateGuard.swift ../Core/Effects.swift \
            ../Core/PulseSource.swift ../Core/AudioActivity.swift ../Core/AudioTap.swift ../Core/OnsetDetector.swift ../Core/BeatPulseSource.swift
 SOURCES := $(CORE) $(wildcard Sources/*.swift)
+RESOURCES := Resources/AppIcon.icns \
+             Resources/StatusKeyActive.png Resources/StatusKeyActive@2x.png \
+             Resources/StatusKeyInactive.png Resources/StatusKeyInactive@2x.png
 
 SWIFTC  := swiftc
 TARGET  := arm64-apple-macos14.0
@@ -22,19 +25,21 @@ FLAGS   := -swift-version 5 -parse-as-library -target $(TARGET) \
 
 all: $(BUNDLE)
 
-$(BUNDLE): $(SOURCES) Resources/Info.plist
+$(BUNDLE): $(SOURCES) Resources/Info.plist $(RESOURCES)
 	@rm -rf $(BUNDLE)
 	@mkdir -p $(CONTENTS)/MacOS $(CONTENTS)/Resources
 	@cp Resources/Info.plist $(CONTENTS)/Info.plist
+	@cp $(RESOURCES) $(CONTENTS)/Resources/
 	$(SWIFTC) -O $(FLAGS) $(SOURCES) -o $(CONTENTS)/MacOS/$(APP)
 	@codesign --force --sign - $(BUNDLE) 2>/dev/null || \
 	  echo "⚠️  ad-hoc 签名失败，开机自启可能不可用"
 	@echo "✅ 已生成 $(BUNDLE)"
 
-debug: $(SOURCES) Resources/Info.plist
+debug: $(SOURCES) Resources/Info.plist $(RESOURCES)
 	@rm -rf $(BUNDLE)
 	@mkdir -p $(CONTENTS)/MacOS $(CONTENTS)/Resources
 	@cp Resources/Info.plist $(CONTENTS)/Info.plist
+	@cp $(RESOURCES) $(CONTENTS)/Resources/
 	$(SWIFTC) -Onone -g $(FLAGS) $(SOURCES) -o $(CONTENTS)/MacOS/$(APP)
 	@codesign --force --sign - $(BUNDLE) 2>/dev/null || true
 

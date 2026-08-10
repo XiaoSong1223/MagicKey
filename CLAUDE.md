@@ -87,7 +87,7 @@ cd tools && make preview     # 真实键盘预览，Ctrl-C 还原
 | **未代码签名/公证** | 开机自启不可用；别人下载会被 Gatekeeper 拦 | 需要 Apple Developer ID（$99/年） |
 | **能耗未实测** | 唯一未覆盖的风险：60Hz 唤醒阻止 SoC 深度空闲 | 已用「空闲即停」硬需求结构性消除。方法见 `tools/TESTING.md` |
 | SwiftPM 坏 | 不能加外部依赖 | 重装 CLT |
-| 无应用图标 | 用的是 SF Symbol `keyboard` | 需要设计 |
+| **内建屏菜单栏没空位** | 灵动岛挂件占了 588–870pt，状态项被放到岛底下看不见 | 用户侧腾位置，见「踩过的坑」 |
 | 只在 M4 / macOS 26 验证过 | Intel 机型、旧系统未知 | 需要更多机器 |
 
 **不能自动化的测试**（需要人工介入，不要浪费时间尝试）：
@@ -104,7 +104,7 @@ cd tools && make preview     # 真实键盘预览，Ctrl-C 还原
 
 - [ ] 低电量自动暂停
 - [ ] 缓动曲线与相位可调
-- [ ] 应用图标
+- [x] ~~应用图标~~ 已有 `AppIcon.icns` 与状态栏专用图 `StatusKey{Active,Inactive}`
 - [ ] 代码签名 + 公证（**不能上 Mac App Store**，私有 API 违反 Review Guidelines 2.5.1）
 - [ ] 分发：GitHub Releases + Homebrew Cask
 
@@ -244,6 +244,50 @@ cd tools && make preview     # 真实键盘预览，Ctrl-C 还原
 
 **60fps 已触及硬件地板。** 4s 呼吸在 60fps 下最差处仅跳 1 档，90/120fps 完全没有改善。
 想改善低亮度段观感要**抬高亮度下限**，不是堆帧率（`--min 0.15@60fps` 优于 `--min 0.05@120fps`）。
+
+**状态栏图标不显示，别在本进程里找原因——先看控制中心的日志。**
+2026-08-10 图标彻底消失、点不开面板。真正的判据只有一条：
+
+```bash
+/usr/bin/log stream --style compact --predicate 'category == "appStatusItems"'
+```
+
+正常的 app 只有 `Starting to track host` → `Adding displayable items`；
+出问题时中间多三行 **`Moving host to blocked list`** → `Starting to track blocked host`
+→ `hiding status items`。macOS 26 由控制中心统一托管所有状态项，它按
+**bundle id** 维护一张 blocked list，被记进去就直接隐藏。
+
+被隐藏时 `NSStatusItem` 不会报错：`isVisible` 仍是 `true`、`button.image` 还在，
+只是窗口退化成一个**贴着屏幕右边缘、高 22pt** 的野窗口（`{1432, 934, 38, 22}`，
+built-in 菜单栏实际是 33pt、外接是 30pt），正好压在控制中心时钟底下——看不见也点不到。
+**高度对不对是最快的体检指标**：等于 22 就是没被托管，等于 33/30 才是真进了菜单栏。
+
+判定是不是 bundle id 的问题只要一步：**把同一个 app 换个 id 再跑**。
+实测同一个二进制换 id 立刻正常（`{769, 923, 38, 33}`），
+而一个 60 行的最小 app 只要顶着 `com.magickey.MagicKey` 就必然被 block。
+`com.magickey.MagicKey2`、`com.magickey.magickey`（只差大小写）都是好的，
+所以是**精确 id** 的记录。
+
+**这些统统没用，别再试一遍**：删 app 自己的整个 defaults 域、改/删
+`com.apple.controlcenter` 的 `NSStatusItem Visible Item-N`（`killall ControlCenter`
+前后都试过）、删 ByHost 的 `displayablemenuextras`、`lsregister -u` 再 `-f`、
+显式写 `NSStatusItem Preferred Position`、`isVisible = true`、先 false 再 true。
+blocked list 存在哪至今没找到——`~/Library` 全文搜 bundle id 一无所获，
+所以**进程外清不掉**。唯一可行的解法是**换 bundle id**（代价：TCC「系统录音」要重授一次，
+设置用 `defaults export 旧 - | defaults import 新 -` 迁移；`StateGuard` 走
+`~/Library/Application Support/MagicKey/` 路径，不受影响）。
+
+**顺带纠正**：`NSStatusItem.Behavior` 的 `1 << 6` 不是 `neverClip`，**`1 << 7` 才是**
+（扫 bit 0–11，只有它让日志打出 `neverClip: true`）。而且置上之后 12/12 照样被 block，
+所以这个私有位对本问题毫无用处，别再往代码里加。
+
+**图标「在菜单栏里但看不见」还有第二个原因：被刘海挂件盖住。**
+本机装了 NookX（灵动岛），它在**层 101**（状态项是层 25）铺了一个
+`x=0..1470, 高 700` 的窗口，中间那块岛是不透明的，实测遮住约 588–870pt。
+built-in 菜单栏上控制中心从 900pt 起往右排，于是留给第三方状态项的空档只剩
+870–900 这 30pt——装不下一个 38pt 的项，系统就把它放到 769pt，正好在岛底下，
+既看不见、点击也被那个高层窗口吃掉。**在内建屏上看不到图标时先确认这一点**，
+它和 blocked list 是两件独立的事，可以同时发生。
 
 **Cocoa 应用默认不处理 SIGTERM。** `pkill`/`killall`/部分注销关机路径都不走
 `applicationWillTerminate`，状态会卡在「ALS 已关闭」。必须用 `DispatchSourceSignal` 显式处理。

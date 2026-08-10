@@ -25,6 +25,8 @@ enum Main {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, ObservableObject {
 
+    private static let statusItemAutosaveName = "MagicKey.StatusItem"
+
     let settings: Settings
     let engine: Engine
     let updates = UpdateChecker()
@@ -34,6 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
 
     private var statusItem: NSStatusItem?
     private let popover = NSPopover()
+    private var statusImages: [Bool: NSImage] = [:]
 
     override init() {
         // 必须在 Engine() 之前——引擎构造时就会做崩溃恢复并输出日志，
@@ -74,7 +77,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
         popover.contentViewController = NSHostingController(
             rootView: MenuBarView(settings: settings, engine: engine, updates: updates))
 
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // autosaveName 让菜单栏位置在重装/重建之间稳定下来。**别再往这里加
+        // 「修复可见性」的代码**：图标不显示是控制中心按 bundle id 把它记进了
+        // blocked list，进程内看到的 isVisible 仍然是 true，怎么写都没用。
+        // 诊断方法和已经排除掉的一长串做法见 CLAUDE.md「状态栏图标不显示」。
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item.autosaveName = Self.statusItemAutosaveName
         item.button?.target = self
         item.button?.action = #selector(togglePanel)
         statusItem = item
@@ -173,9 +181,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
 
     /// 运行时用实心图标，停止时用线框，一眼能看出状态
     private func updateIcon() {
-        statusItem?.button?.image = NSImage(
-            systemSymbolName: engine.isRunning ? "keyboard.fill" : "keyboard",
-            accessibilityDescription: "MagicKey")
+        guard let button = statusItem?.button else { return }
+        let isRunning = engine.isRunning
+        let label = isRunning ? "MagicKey 正在运行" : "MagicKey 已停止"
+        let image = customStatusImage(isRunning: isRunning) ?? NSImage(
+            systemSymbolName: isRunning ? "keyboard.fill" : "keyboard",
+            accessibilityDescription: label)
+
+        image?.size = NSSize(width: 18, height: 18)
+        image?.isTemplate = true
+        button.image = image
+        button.setAccessibilityLabel(label)
+        button.toolTip = label
+    }
+
+    private func customStatusImage(isRunning: Bool) -> NSImage? {
+        if let cached = statusImages[isRunning] { return cached }
+
+        let name = isRunning ? "StatusKeyActive" : "StatusKeyInactive"
+        let size = NSSize(width: 18, height: 18)
+        // 让 AppKit 从应用包按名称加载 1x/@2x 表示。macOS 26 会把状态项
+        // 托管给 Control Center；直接使用 bundle-backed NSImage 才能稳定地
+        // 复制到外接显示器，运行时拼装 NSBitmapImageRep 会丢失状态项副本。
+        guard let image = Bundle.main.image(forResource: NSImage.Name(name)) else { return nil }
+        image.size = size
+        image.isTemplate = true
+        statusImages[isRunning] = image
+        return image
     }
 
     private func syncFromSettings() {

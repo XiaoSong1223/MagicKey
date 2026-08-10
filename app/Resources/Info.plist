@@ -4,14 +4,22 @@
 <dict>
     <key>CFBundleExecutable</key>
     <string>MagicKey</string>
+    <!-- 2026-08-10 从 com.magickey.MagicKey 换过来。**别换回去**：那个 id 被
+         macOS 26 的 Control Center 记进了 blocked list，状态栏图标会被直接隐藏
+         （日志里是 "Moving host to blocked list"），进程外清不掉。详见 CLAUDE.md。
+         换 id 的代价是 TCC「系统录音」授权要重新给一次。 -->
     <key>CFBundleIdentifier</key>
-    <string>com.magickey.MagicKey</string>
+    <string>io.github.xiaosong1223.MagicKey</string>
     <key>CFBundleName</key>
     <string>MagicKey</string>
     <key>CFBundleDisplayName</key>
     <string>MagicKey</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon.icns</string>
     <!-- 面板底部显示的就是这个字符串，同时是更新检查的比较基准
          （UpdateChecker.isNewer(latest, than: current)）。**每次发版必须改**，
          忘了改的话不但显示错版本，还会把仓库里已发布的版本判成「有新版本」。 -->
