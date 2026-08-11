@@ -83,12 +83,21 @@ private extension View {
 
     /// macOS 14–25 的兜底。**这不是一套设计过的回退外观**——
     /// 2026-08-11 决定不为旧系统做外观，本机也没有 14/15 可以实测。
-    /// 它存在的唯一目的是让「哪一格被选中」在旧系统上仍然看得见，
-    /// 没有它选中态就完全不可见了。
+    /// 它存在的唯一目的是让「哪一格被选中」在旧系统上仍然看得见。
+    ///
+    /// 用**着色填充 + 实心描边**而不是原来的 `.quaternary`：一块灰底配
+    /// accent 色文字，在浅色模式下和未选中格的差别很弱，而这条路径正好是
+    /// **没有机器可以实测的那条**。看不见时没人会来报 bug，只会觉得应用是坏的，
+    /// 所以这里宁可过强也不要过弱。描边是主要判据，填充只是辅助——
+    /// 高对比度和「降低透明度」辅助功能开启时，填充可能被系统压掉，描边不会。
     func minimalSelection() -> some View {
         background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(.quaternary)
+                .fill(.tint.opacity(0.15))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(.tint, lineWidth: 1)
+                )
         )
     }
 }

@@ -93,11 +93,12 @@ make -C app uninstall
 ## 系统要求
 
 - macOS 14 或更高版本
-- Apple Silicon MacBook
+- Apple Silicon MacBook。发行包是 arm64 单架构二进制，**Intel 机型无法启动**
 - 带背光的内置键盘
 - 音乐律动需要 macOS 14.2 或更高版本
 - 界面外观面向 macOS 26 设计与实测。在 macOS 14–15 上功能完整，
-  但未针对旧版外观做设计，也尚未在这些版本上验证
+  Liquid Glass 自动回退为系统标准外观，效果网格的选中态改用着色描边标示；
+  这条回退路径尚未在真机上验证
 
 MagicKey 面向 MacBook 内置键盘背光；外接键盘不在支持范围内。
 
