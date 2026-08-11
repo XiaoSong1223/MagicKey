@@ -18,3 +18,6 @@ xcuserdata/
 # UI 探针构建产物
 app/magickey-uiprobe
 app/magickey-uiprobe.dSYM/
+
+# 发行包（走 GitHub Releases，不进仓库）
+app/MagicKey-*.zip
