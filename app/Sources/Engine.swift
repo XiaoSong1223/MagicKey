@@ -29,9 +29,27 @@ private final class RenderState {
 @MainActor
 final class Engine: ObservableObject {
 
+    /// UI 用的结构化状态。
+    ///
+    /// **为什么不让界面去解析 `status` 字符串。** `status` 是给日志和调试看的
+    /// 自由文本（"运行中 · 60fps"、"已暂停（锁屏）"）；界面要拿它决定色点颜色，
+    /// 就只能 `hasPrefix("已暂停")`，以后改一个字就静默错色。两者的受众不同，
+    /// 所以并存而不是二选一：`status` 一个字都没改，`phase` 是新加的。
+    enum Phase: Equatable {
+        /// 驱动探测失败。相关控件要禁用
+        case unsupported
+        /// 用户主动关掉了
+        case stopped
+        /// 用户开着，但条件不满足（锁屏/息屏/空闲）。**总开关保持开启**，
+        /// 条件恢复时自动继续，不需要用户再点一次
+        case paused(String)
+        case running
+    }
+
     @Published private(set) var isRunning = false
     @Published private(set) var status = "未启动"
     @Published private(set) var available = true
+    @Published private(set) var phase: Phase = .stopped
 
     private var driver: CoreBrightnessDriver?
     private var guardian: StateGuard?
@@ -43,6 +61,14 @@ final class Engine: ObservableObject {
     private var userWants = false
     private var conditionsOK = true
 
+    /// 最近一次**条件**变化的原因，只由 `setConditions` 写。
+    ///
+    /// 不能直接用 `reconcile(reason:)` 的参数来做「已暂停 · 原因」：那个参数
+    /// 也可能是 `apply(_:)` 传来的"设置变更"。锁屏期间拖一下亮度滑块，
+    /// 界面就会从「已暂停 · 锁屏」翻成「已暂停 · 设置变更」——原因被顶掉了。
+    /// （`status` 字符串至今有这个毛病，这次不动它，只保证 `phase` 是对的。）
+    private var conditionsReason = "启动"
+
     private var makeEffect: (() -> Effect)?
     private var fps: Double = 60
     private var baseLevel: Float = 0.85
@@ -53,6 +79,7 @@ final class Engine: ObservableObject {
         guard let d = CoreBrightnessDriver() else {
             available = false
             status = "此 macOS 版本不受支持"
+            phase = .unsupported
             return
         }
         driver = d
@@ -62,6 +89,44 @@ final class Engine: ObservableObject {
         guardian = g
         status = "已就绪"
     }
+
+    #if UI_PROBE
+    /// **只在 UI 探针里编译。** `app/Makefile` 的正式目标不带 `-D UI_PROBE`，
+    /// 所以这段代码不会进入发布的二进制——不是「测试代码留在生产里但没人调用」，
+    /// 是真的编译不到。
+    ///
+    /// 不走正常 `init()` 的理由是 `StateGuard`：正常路径会跑一次
+    /// `recoverFromPreviousCrashIfNeeded()`，那会**清掉正在运行的那个 MagicKey
+    /// 的崩溃恢复标记**。探针只是要摆一个界面出来看，不该有这种副作用。
+    init(probe phase: Phase) {
+        self.phase = phase
+        switch phase {
+        case .unsupported:
+            available = false; isRunning = false; status = "此 macOS 版本不受支持"
+        case .stopped:
+            isRunning = false; status = "已停止"
+        case .paused(let why):
+            isRunning = false; status = "已暂停（\(why)）"
+        case .running:
+            isRunning = true;  status = "运行中 · 60fps"
+        }
+    }
+
+    /// 探针切状态用。真实的 Engine 只有一个实例、靠 `reconcile` 改 phase，
+    /// 探针也必须只有一个实例——换 `Engine` 对象就得换 `NSHostingController`，
+    /// 而**换控制器的 NSPopover 不会重算尺寸**，量出来的高度会全是上一次的。
+    func setProbePhase(_ p: Phase) {
+        phase = p
+        available = p != .unsupported
+        isRunning = p == .running
+        switch p {
+        case .unsupported:   status = "此 macOS 版本不受支持"
+        case .stopped:       status = "已停止"
+        case .paused(let w): status = "已暂停（\(w)）"
+        case .running:       status = "运行中 · 60fps"
+        }
+    }
+    #endif
 
     // MARK: - 外部输入
 
@@ -76,6 +141,7 @@ final class Engine: ObservableObject {
     func setConditions(ok: Bool, reason: String) {
         guard conditionsOK != ok else { return }
         conditionsOK = ok
+        conditionsReason = reason
         reconcile(reason: reason)
     }
 
@@ -89,6 +155,7 @@ final class Engine: ObservableObject {
         guardian?.restore(reason: reason)
         isRunning = false
         status = "已还原（\(reason)）"
+        phase = .stopped
     }
 
     // MARK: - 状态收敛
@@ -118,6 +185,12 @@ final class Engine: ObservableObject {
         case (false, false):
             status = userWants ? "已暂停（\(reason)）" : "已停止"
         }
+
+        // 四个分支的 phase 是同一个式子，所以收在这里算一次。
+        // 注意用 conditionsReason 而不是 reason——理由见它的声明。
+        phase = should ? .running
+              : userWants ? .paused(conditionsReason)
+              : .stopped
     }
 
     private func installState() {

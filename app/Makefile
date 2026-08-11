@@ -18,10 +18,33 @@ RESOURCES := Resources/AppIcon.icns \
 
 SWIFTC  := swiftc
 TARGET  := arm64-apple-macos14.0
-FLAGS   := -swift-version 5 -parse-as-library -target $(TARGET) \
+
+# Liquid Glass（glassEffect / GlassEffectContainer）只存在于 macOS 26 SDK。
+# 用**构建时的 SDK 版本**决定要不要编那段代码——注意这和 deployment target
+# 是两回事：SDK 26 + target 14.0 完全合法，玻璃代码由 @available(macOS 26.0)
+# 在运行时再挡一层，14/15 上走 material 回退。
+#
+# 用 CommandLineTools（SDK ≤ 15.x）构建时这个标志不会定义，那段代码整个不编译，
+# 界面自动是回退外观。
+SDK_MAJOR  := $(shell xcrun --sdk macosx --show-sdk-version 2>/dev/null | cut -d. -f1)
+GLASS_FLAG := $(shell [ "$(SDK_MAJOR)" -ge 26 ] 2>/dev/null && echo -D LIQUID_GLASS_SDK)
+
+FLAGS   := -swift-version 5 -parse-as-library -target $(TARGET) $(GLASS_FLAG) \
            -framework SwiftUI -framework AppKit -framework ServiceManagement
 
-.PHONY: all run debug install uninstall clean
+# UI 探针：复用 app 的**真实**视图和状态类型，只把入口换掉。
+# 排除 MagicKeyApp.swift（它带 @main），加上 Probe/UIProbe.swift。
+#
+# `-D UI_PROBE` 开启 Engine 的探针构造器——正式目标不带这个标志，
+# 所以那段代码不会进入发布的二进制。
+# 编成裸可执行文件而不是 .app：无 bundle 就没有 bundle id，
+# 既不会被控制中心的 blocked list 认领，UserDefaults 也落在单独的域里，
+# 不会污染正在运行的那个 MagicKey 的设置。
+PROBE_BIN     := magickey-uiprobe
+PROBE_SOURCES := $(CORE) $(filter-out Sources/MagicKeyApp.swift,$(wildcard Sources/*.swift)) \
+                 Probe/UIProbe.swift
+
+.PHONY: all run debug install uninstall clean probe-ui
 
 all: $(BUNDLE)
 
@@ -59,5 +82,12 @@ uninstall:
 	@pkill -x $(APP) 2>/dev/null || true
 	rm -rf /Applications/$(BUNDLE)
 
+# 面板高度 / 无障碍标签 / 运行状态的回归检查。可与正在运行的 MagicKey 并行。
+probe-ui: $(PROBE_BIN)
+	./$(PROBE_BIN)
+
+$(PROBE_BIN): $(PROBE_SOURCES)
+	$(SWIFTC) -Onone -g $(FLAGS) -D UI_PROBE $(PROBE_SOURCES) -o $(PROBE_BIN)
+
 clean:
-	rm -rf $(BUNDLE)
+	rm -rf $(BUNDLE) $(PROBE_BIN) $(PROBE_BIN).dSYM

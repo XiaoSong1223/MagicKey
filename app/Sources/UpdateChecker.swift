@@ -127,6 +127,22 @@ final class UpdateChecker: ObservableObject {
         state = Self.isNewer(latest, than: current) ? .available(latest, url) : .upToDate
     }
 
+    #if UI_PROBE
+    /// 只在 UI 探针里编译。五种状态里只有三种能靠真实网络触发
+    /// （idle / checking / failed-404，因为仓库还是 Private），
+    /// 另外两种要等仓库公开且发过 release——但 Footer 会不会被长文案撑宽
+    /// 现在就得验，不能等。
+    func setProbeState(_ s: State) { state = s }
+
+    static let probeStates: [(String, State)] = [
+        ("idle",      .idle),
+        ("checking",  .checking),
+        ("upToDate",  .upToDate),
+        ("available", .available("9.99", URL(string: "https://example.invalid")!)),
+        ("failed",    .failed("仓库尚未公开发布（Private 或还没有 release）")),
+    ]
+    #endif
+
     /// 逐段数字比较。"0.10" > "0.9"——字符串比较在这里是错的。
     /// 非数字段（"0.4-beta"）取前缀数字，比不出来就当相等，宁可不提示也不误报。
     static func isNewer(_ a: String, than b: String) -> Bool {

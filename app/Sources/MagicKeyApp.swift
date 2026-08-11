@@ -30,6 +30,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
     let settings: Settings
     let engine: Engine
     let updates = UpdateChecker()
+    let audio = AudioStatusModel()
+    let metrics = PanelMetrics()
     private let idle = IdleMonitor()
     private var cancellables: [Any] = []
     private var signalSources: [DispatchSourceSignal] = []
@@ -49,6 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installSignalHandlers()
+        installMainMenu()
         setUpMenuBar()
 
         idle.onChange = { [weak self] ok, reason in
@@ -69,13 +72,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
         syncFromSettings()
     }
 
+    // MARK: - 主菜单
+
+    /// **LSUIElement 应用不显示菜单栏，但键盘等价物仍然靠 `mainMenu` 路由。**
+    /// 不建这个菜单，⌘Q 在本应用里就是死的——实测过：`NSApp.mainMenu` 从未设置，
+    /// 按 ⌘Q 毫无反应。而在面板改版之前，那个「退出」按钮是**唯一**的退出方式，
+    /// 一旦它从 Footer 里挪走，用户就只能去活动监视器了。
+    ///
+    /// 菜单本身永远不会被看见（没有 Dock 图标、activationPolicy 是 .accessory），
+    /// 所以这里只放真正需要快捷键的项，不追求菜单结构完整。
+    private func installMainMenu() {
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "关于 MagicKey",
+                        action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
+                        keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "设置…",
+                        action: #selector(openSettings), keyEquivalent: ",")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "关闭窗口",
+                        action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        appMenu.addItem(withTitle: "退出 MagicKey",
+                        action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+
+        let appItem = NSMenuItem()
+        appItem.submenu = appMenu
+
+        let main = NSMenu()
+        main.addItem(appItem)
+        NSApp.mainMenu = main
+    }
+
     // MARK: - 菜单栏
 
     private func setUpMenuBar() {
         popover.behavior = .transient          // 点面板外面就关，和菜单一致
         popover.delegate = self
         popover.contentViewController = NSHostingController(
-            rootView: MenuBarView(settings: settings, engine: engine, updates: updates))
+            rootView: MenuBarView(settings: settings, engine: engine, updates: updates,
+                                  audio: audio, metrics: metrics,
+                                  openSettings: { [weak self] in self?.openSettings() }))
 
         // autosaveName 让菜单栏位置在重装/重建之间稳定下来。**别再往这里加
         // 「修复可见性」的代码**：图标不显示是控制中心按 bundle id 把它记进了
@@ -109,10 +145,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
         //   ② 停在**另一块屏**上——外接屏全屏时按钮窗口留在内建屏，
         //      锚点「在某块屏幕上」这个检查照样通过，面板就开到左边那块屏去了。
         // 所以判据不是「锚点在不在屏幕上」，而是「**在不在用户刚点的那块屏上**」。
+        // 面板能用多高，必须在 show 之前算好推给视图——视图那时还没有 window，
+        // 自己判断不出会被摆到哪块屏。见 PanelMetrics 的注释。
+        let barHeight = button.window?.frame.height
         if buttonAnchorIsUsable(button) {
+            metrics.update(screen: button.window?.screen ?? clickedScreen(),
+                           statusBarHeight: barHeight)
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         } else {
-            showPanelNearMouse(statusBarHeight: button.window?.frame.height)
+            // 走鼠标兜底时面板会开在指针所在屏，高度也要按那块屏算
+            metrics.update(screen: clickedScreen() ?? NSScreen.main,
+                           statusBarHeight: barHeight)
+            showPanelNearMouse(statusBarHeight: barHeight)
         }
         // 面板里全是滑块，打开就要能直接拖，所以得让本进程拿到焦点
         NSApp.activate()
@@ -177,6 +221,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
 
     func popoverDidClose(_ notification: Notification) {
         anchorWindow.orderOut(nil)
+    }
+
+    /// 打开设置窗口。面板是 `.transient` 的，窗口一拿到焦点它就自己关了——
+    /// 这是想要的行为，不用手动 close。
+    @objc private func openSettings() {
+        SettingsWindowController.show(settings: settings, updates: updates)
     }
 
     /// 运行时用实心图标，停止时用线框，一眼能看出状态

@@ -160,12 +160,6 @@ final class Settings: ObservableObject {
         didSet { Self.d.set(autoCheckUpdates, forKey: "autoCheckUpdates") }
     }
 
-    /// 「高级」是否展开。持久化是因为它标记的是**用户类型**而不是一次操作——
-    /// 会展开的人下次还想看见，不该每次开菜单都重新折叠。
-    @Published var showAdvanced: Bool = Settings.bool("showAdvanced", false) {
-        didSet { Self.d.set(showAdvanced, forKey: "showAdvanced") }
-    }
-
     /// 「快慢」滑块用的归一化速度：0 = 最慢，1 = 最快。
     ///
     /// 主界面不暴露「周期 4.0 秒」这种工程师语言。方向也是反的——

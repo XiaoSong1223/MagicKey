@@ -14,3 +14,7 @@ DerivedData/
 *.xcuserstate
 xcuserdata/
 .claude/worktrees/
+
+# UI 探针构建产物
+app/magickey-uiprobe
+app/magickey-uiprobe.dSYM/

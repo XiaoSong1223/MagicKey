@@ -1,5 +1,32 @@
 import Foundation
 
+/// 音乐律动对用户可见的状态。
+///
+/// **为什么不能只有「开/关」两态。** 这条管线有三种截然不同的"没在闪"：
+/// 系统版本不够、没拿到授权、以及**根本没有声音在放**。第三种是完全正常的，
+/// 但它和前两种在外部看起来一模一样（都是零脉冲）。2026-08-06 定位音频问题时
+/// 在这上面连着花了四轮——盯着「回调 0 次」改聚合设备配方，而全程没有任何音频在播放。
+/// 把它们分开显示不是锦上添花，是那次教训的直接产物。
+enum AudioStatus: Equatable {
+    /// 没在用（没选中音乐效果，或已停止采集）
+    case inactive
+    /// 系统版本不够。`AudioHardwareCreateProcessTap` 需要 macOS 14.2+
+    case unsupportedOS
+    /// 正在建立管线。实测 1.8–4.6 秒，UI 要容忍，别当卡死
+    case starting
+    /// **推断**：撞上了建立超时，多半是没给「系统录音」授权。
+    /// 见 `AudioTap.State.unavailable` 的注释——文案必须用「似乎」，不能断言
+    case needsPermission
+    /// 其它建立失败，带原始原因
+    case failed(String)
+    /// 管线好着呢，只是系统当前没有音频在播放。**这不是故障**
+    case idleNoAudio
+    /// 系统在放音频，却收不到样本。这才是真坏了
+    case stalled
+    /// 正常工作，有样本在流
+    case active
+}
+
 /// 把「系统音频里的鼓点」变成 `PulseSource`，接上已经磨好的脉冲包络。
 ///
 /// 三段拼起来：`AudioTap`（拿样本）→ `OnsetDetector`（认出起音）→ 这里（交给渲染线程）。
@@ -51,10 +78,27 @@ final class BeatPulseSource: PulseSource {
     private var params = OnsetDetector.Params()
     private var detectorDirty = true
     private var lastDrain = Date.distantPast
+    private var _status: AudioStatus = .inactive
+    private var _onStatusChange: ((AudioStatus) -> Void)?
+
+    /// 当前状态。任意线程可读。
+    var status: AudioStatus { lock.withLock { _status } }
+
+    /// 状态变更通知。**在 `queue` 上调用，不是主线程**——UI 要自己切回去。
+    /// 只在状态真正改变时触发，所以 1Hz 轮询不会把它变成一个刷屏的回调。
+    var onStatusChange: ((AudioStatus) -> Void)? {
+        get { lock.withLock { _onStatusChange } }
+        set { lock.withLock { _onStatusChange = newValue } }
+    }
 
     /// 只在音频线程上碰
     private var detector: OnsetDetector?
     private var framesSeen: Int = 0
+
+    /// 只在 `queue` 上碰。连续多少次轮询看到「在放音频却没有新回调」。
+    /// 需要计数而不是一次就报：管线刚建好那一两秒本来就还没有第一次回调，
+    /// 那时候下「坏了」的结论是冤枉它（`AudioTap.Diagnostics.summary` 里同样的谨慎）。
+    private var stalledPolls = 0
 
     private var tap: AnyObject?          // AudioTap，@available 挡着不能写进类型
     private var idleTimer: DispatchSourceTimer?
@@ -72,16 +116,23 @@ final class BeatPulseSource: PulseSource {
     func activate() {
         guard #available(macOS 14.2, *) else {
             Log.write("[beat] 需要 macOS 14.2+，音频律动不可用")
+            setStatus(.unsupportedOS)
             return
         }
         lock.withLock { lastDrain = Date() }
+        setStatus(.starting)          // 立刻置位，别让 UI 停在上一次的状态上等 1 秒
         queue.async { [self] in
             startIdleWatchdogIfNeeded()
             guard tap == nil else { return }
 
             let t = AudioTap()
             t.onSamples = { [weak self] ptr, n in self?.consume(ptr, n) }
-            t.onStateChange = { st in Log.write("[beat] tap 状态 → \(st)") }
+            // onStateChange 在 AudioTap 自己的 setupQueue 上来，跳回本队列再算，
+            // 免得 refreshStatus 同时被两条队列调用。
+            t.onStateChange = { [weak self] st in
+                Log.write("[beat] tap 状态 → \(st)")
+                self?.queue.async { self?.refreshStatus() }
+            }
             tap = t
             t.start()
         }
@@ -100,6 +151,8 @@ final class BeatPulseSource: PulseSource {
             }
             detector = nil
             framesSeen = 0
+            stalledPolls = 0
+            setStatus(.inactive)
         }
     }
 
@@ -113,10 +166,65 @@ final class BeatPulseSource: PulseSource {
             if idle > Self.idleStopSeconds {
                 Log.write("[beat] 已 \(Int(idle))s 无人取脉冲 → 停止音频采集")
                 self.deactivate()
+                return
             }
+            // 「有没有样本在流」不是状态变更，`onStateChange` 报不出来——
+            // tap 一直是 .running，变的只是回调有没有来。只能轮询。
+            self.refreshStatus()
         }
         t.resume()
         idleTimer = t
+    }
+
+    // MARK: - 状态推导
+
+    private func setStatus(_ new: AudioStatus) {
+        // 回调不能在持锁时调用（实现方多半要 DispatchQueue.main.async，
+        // 但万一它同步回来读 status 就死锁了）。取出来，放锁，再调。
+        let notify: ((AudioStatus) -> Void)? = lock.withLock {
+            guard _status != new else { return nil }
+            _status = new
+            return _onStatusChange
+        }
+        notify?(new)
+    }
+
+    /// 只在 `queue` 上调用。
+    ///
+    /// **`.running` 不等于「在闪」**，这是整个七态存在的理由：管线建好之后，
+    /// 「有样本流入」「系统没在放声音」「在放声音却收不到」三种情况下 tap 的
+    /// `state` 完全一样。区分它们要靠 `diagnostics()` 里的 `outputIsRunning`
+    /// 和 `secondsSinceLastCallback`。
+    ///
+    /// `diagnostics()` 会调 `AudioActivity.outputIsRunning()`——首次约 80ms，
+    /// 所以这个函数**绝不能上主线程**。放在 utility QoS 的 `queue` 上是安全的，
+    /// 而且 `AudioTap` 自己的看门狗本来就每 2 秒调一次同一个东西，没有新增成本。
+    private func refreshStatus() {
+        guard #available(macOS 14.2, *) else { setStatus(.unsupportedOS); return }
+        guard let t = tap as? AudioTap else { setStatus(.inactive); return }
+
+        let d = t.diagnostics()
+        switch d.state {
+        case .idle, .starting:
+            stalledPolls = 0
+            setStatus(.starting)
+
+        case .unavailable(let why, let timedOut):
+            stalledPolls = 0
+            setStatus(timedOut ? .needsPermission : .failed(why))
+
+        case .running:
+            if let ago = d.secondsSinceLastCallback, ago < 1.0 {
+                stalledPolls = 0
+                setStatus(.active)
+            } else if !d.outputIsRunning {
+                stalledPolls = 0
+                setStatus(.idleNoAudio)          // 正常，不是故障
+            } else {
+                stalledPolls += 1
+                setStatus(stalledPolls >= 3 ? .stalled : .starting)
+            }
+        }
     }
 
     // MARK: - 音频线程

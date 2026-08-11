@@ -176,7 +176,16 @@ final class AudioTap {
         /// 系统没在放声音时一次回调都不会有，那是正常的。要分辨请看 `diagnostics()`。
         case running
         /// 整体不可用，附带原因。不做任何后台重试的假装。
-        case unavailable(String)
+        ///
+        /// `timedOut` 单独标出来，是因为它**几乎总是「未授权」**：未获得
+        /// 「系统录音」授权时 `AudioHardwareCreateProcessTap` 照样返回 0，
+        /// 真正卡住的是 `AudioDeviceCreateIOProcIDWithBlock`——它不返回错误码，
+        /// 而是永久阻塞在 `_TellServerAboutStreamUsage` 的 `mach_msg` 上。
+        /// 所以「撞上 setupTimeout」是这个进程能拿到的、最接近「未授权」的信号。
+        ///
+        /// **它只是信号，不是判据**：一个真卡死的 coreaudiod 长得一模一样。
+        /// 拿它做 UI 文案时要用「似乎/可能」，不要断言。
+        case unavailable(reason: String, timedOut: Bool)
     }
 
     /// 状态变更通知。**在 AudioTap 自己的串行队列上调用**，UI 要自己切回主线程。
@@ -216,7 +225,7 @@ final class AudioTap {
             switch state {
             case .idle:                 return "未启动"
             case .starting:             return "正在建立管线（可能要几秒）"
-            case .unavailable(let why): return "不可用：\(why)"
+            case .unavailable(let why, _): return "不可用：\(why)"
             case .running:
                 if let ago = secondsSinceLastCallback, ago < 1.0 {
                     return String(format: "运行中，有样本流入（累计 %llu 次回调）", callbackCount)
@@ -359,11 +368,13 @@ final class AudioTap {
 
     // MARK: 建立管线
 
-    private func fail(_ message: String) -> Bool {
+    /// - Parameter timedOut: 只有「等 `AudioDeviceCreateIOProcIDWithBlock` 超时」
+    ///   这一条路径传 true。见 `State.unavailable` 的注释——它是「未授权」的信号。
+    private func fail(_ message: String, timedOut: Bool = false) -> Bool {
         resources?.destroy(reason: "建立失败")
         resources = nil
         Log.write("[audiotap] ❌ \(message)")
-        setState(.unavailable(message))
+        setState(.unavailable(reason: message, timedOut: timedOut))
         return false
     }
 
@@ -532,7 +543,8 @@ final class AudioTap {
             // 二来聚合设备一消失，卡住的那次调用多半会带着错误返回（**这一点是推测，
             // 没实测过**）；就算它真的永不返回，至少 tap 不会一直挂在 coreaudiod 上。
             return fail("AudioDeviceCreateIOProcIDWithBlock 超过 \(Int(setupTimeout))s 未返回。"
-                        + "实测它在有音频播放时耗时 1.8–4.6s，无音频播放时可能永久阻塞")
+                        + "实测它在有音频播放时耗时 1.8–4.6s，无音频播放时可能永久阻塞",
+                        timedOut: true)
         }
 
         guard handoff.status == noErr, let procID = handoff.procID else {

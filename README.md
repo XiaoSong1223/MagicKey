@@ -29,14 +29,20 @@ xattr -dr com.apple.quarantine /Applications/MagicKey.app
 
 ### 从源码构建
 
-需要先安装 Xcode Command Line Tools：
+需要 Xcode 26 或更高版本（SDK 26）：
 
 ```bash
-xcode-select --install
+xcode-select -p                          # 应指向 /Applications/Xcode.app/...
+xcrun --sdk macosx --show-sdk-version    # 应为 26 或更高
 git clone https://github.com/XiaoSong1223/MagicKey.git
 cd MagicKey
 make -C app install
 ```
+
+> [!IMPORTANT]
+> 界面的 Liquid Glass 外观由**构建时链接的 SDK 版本**决定，而非运行时的系统版本。
+> 使用 Command Line Tools（SDK 15 及更早）构建出的二进制，即使运行在 macOS 26 上
+> 也只会呈现旧版外观。`app/Makefile` 会自动检测 SDK 版本并选择对应的代码路径。
 
 `make install` 会构建应用、进行本地 ad-hoc 签名、复制到 `/Applications`，然后启动 MagicKey。启动后点击菜单栏中的键帽图标即可设置效果。
 
@@ -90,6 +96,8 @@ make -C app uninstall
 - Apple Silicon MacBook
 - 带背光的内置键盘
 - 音乐律动需要 macOS 14.2 或更高版本
+- 界面外观面向 macOS 26 设计与实测。在 macOS 14–15 上功能完整，
+  但未针对旧版外观做设计，也尚未在这些版本上验证
 
 MagicKey 面向 MacBook 内置键盘背光；外接键盘不在支持范围内。
 

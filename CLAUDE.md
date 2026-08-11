@@ -36,21 +36,32 @@ macOS 菜单栏应用，给 MacBook 内置键盘背光加动态效果（呼吸/�
 ```bash
 cd app   && make install     # 构建 + 装到 /Applications + 启动
 cd app   && make run         # 直接跑 bundle 内可执行文件，日志打终端（调试用）
+cd app   && make probe-ui    # UI 回归：面板高度/收缩/窄屏/五态/更新五态
 cd tools && make analyze     # 分析效果曲线
 cd tools && make preview     # 真实键盘预览，Ctrl-C 还原
 ```
 
-### ⚠️ SwiftPM 在这台机器上是坏的
+### 工具链：Xcode 26.6 / SDK 26.5（2026-08-11 起）
 
-`swift build` 链接失败。根因：CommandLineTools 升级时新旧文件混装，
-`PackageDescription.swiftmodule/*.private.swiftinterface` 停留在 2024-02，
-而 dylib 是 2025-05，`SwiftVersion` vs `SwiftLanguageMode` 类型对不上。
+```bash
+xcode-select -p          # → /Applications/Xcode.app/Contents/Developer
+xcrun --sdk macosx --show-sdk-version   # → 26.5
+```
 
-**不要试图修 Package.swift，改用 `make`（swiftc 直接编译）。**
-引入第一个外部依赖（Sparkle）前需要重装一次 Command Line Tools。
+`swiftc` 走 Xcode 的工具链（Swift 6.3.3），deployment target 仍是 `macos14.0`。
 
-同一次升级还留下过 `usr/include/swift/module.modulemap`（2023-08）导致 `swiftc`
-完全不可用，已通过重命名解决（备份在同目录 `.bak`）。
+**Liquid Glass 是按「构建时链接的 SDK 版本」启用的，不是按运行时系统版本。**
+用 SDK 15.5 编出来的二进制即使跑在 macOS 26 上，系统控件也仍然是 Tahoe 之前的外观
+（这正是 Apple 给 SDK 26 编译的 app 留 `UIDesignRequiresCompatibility` 退出开关的原因）。
+所以「靠系统免费拿到玻璃」这条也要求 SDK 26，不只是自定义 `glassEffect` 要求。
+`app/Makefile` 按 SDK 主版本号定义 `-D LIQUID_GLASS_SDK`，用旧工具链构建时
+那段代码整个不编译，自动走 material 回退。
+
+~~**SwiftPM 在这台机器上是坏的**~~ ——那是 CommandLineTools 的 `PackageDescription`
+新旧文件混装导致的，装了 Xcode 26 之后不再适用。**但项目仍然用 `make`（swiftc 直接编译）**：
+换构建系统不解决任何现存问题，而 Sparkle 这类外部依赖本来就排在代码签名之后。
+（旧 CLT 还留下过 `usr/include/swift/module.modulemap` 导致 `swiftc` 完全不可用，
+已重命名解决，备份在同目录 `.bak`。切回 CLT 时会再遇到。）
 
 ---
 
@@ -70,6 +81,12 @@ cd tools && make preview     # 真实键盘预览，Ctrl-C 还原
 | 省电模式（30fps） | ✅ |
 | 「空闲即停」 | ✅ 锁屏/息屏/切换用户/无输入/**有音频在放则不算空闲** |
 | 开机自启 `SMAppService` | ⚠️ 代码就绪，未签名时会失败并如实提示 |
+| 面板重做「冷光玻璃控制台」 | ✅ Header/2×3 EffectGrid/固定 Footer，探针全绿 |
+| 独立设置窗口 `SettingsWindowController` | ✅ 单页 Form 四分组，单例 |
+| `Engine.Phase` 结构化状态（绿/灰/橙/红） | ✅ `status` 字符串原样保留 |
+| 音乐律动七态 `AudioStatus` | ✅ 含「没声音在放」与推断的「未授权」+ 跳转 |
+| `mainMenu` / ⌘Q | ✅ 之前 ⌘Q 完全无效（从未设过 mainMenu） |
+| UI 探针 `make probe-ui` | ✅ 高度/收缩/窄屏/五态/更新五态 |
 | 状态还原 **六个时机** | ✅ 全部实测：正常退出、手动停止、崩溃重启、系统睡眠、SIGTERM、锁屏 |
 
 ### 性能实测（30 分钟长测，10.8 万帧）
@@ -86,7 +103,7 @@ cd tools && make preview     # 真实键盘预览，Ctrl-C 还原
 |---|---|---|
 | **未代码签名/公证** | 开机自启不可用；别人下载会被 Gatekeeper 拦 | 需要 Apple Developer ID（$99/年） |
 | **能耗未实测** | 唯一未覆盖的风险：60Hz 唤醒阻止 SoC 深度空闲 | 已用「空闲即停」硬需求结构性消除。方法见 `tools/TESTING.md` |
-| SwiftPM 坏 | 不能加外部依赖 | 重装 CLT |
+| **macOS 14/15 外观是「能用」不是「做过」** | 2026-08-11 决定不为旧系统做外观。选中格在 <26 上只有一块 `.quaternary` 底，保证看得见而已；也没有 14/15 的机器可实测 | 真要支持就得先有机器 |
 | **内建屏菜单栏没空位** | 灵动岛挂件占了 588–870pt，状态项被放到岛底下看不见 | 用户侧腾位置，见「踩过的坑」 |
 | 只在 M4 / macOS 26 验证过 | Intel 机型、旧系统未知 | 需要更多机器 |
 
@@ -355,6 +372,51 @@ built-in 菜单栏上控制中心从 900pt 起往右排，于是留给第三方�
 > `documentView` / `contentView` 高度差，就知道有没有溢出。探针里把 `Engine` 换成
 > 同接口的桩（面板只用到 `available`/`status`/`isRunning` 三个属性），
 > 就不必引入 `Driver`/`StateGuard`，也不会动到正在运行的那个实例的崩溃恢复状态。
+
+**面板「只涨不缩」也会在 `NSPopover` 上复发——`.fixedSize(vertical:)` 必须在最外层。**
+从 `MenuBarExtra` 换到 `NSPopover` 解决的是同一个症状，但换过来**不等于免疫**。
+改成 Header/中段/Footer 三段布局时，我把 `.fixedSize` 从最外层挪到了中间的
+ScrollView 上，最外层只剩 `.frame(maxHeight:)`——面板立刻变回只涨不缩
+（探针实测：内容 312pt→197pt，面板纹丝不动停在 402pt）。
+根因是 `frame(maxHeight:)` 的语义是「**接受**父级提议，钳到上限」，而
+`NSHostingController` 提议的正是窗口当前尺寸，于是形成自锁。
+`fixedSize(vertical:)` 把提议改成 nil，强制取内容理想高，回路才断。
+**顺序是：`ScrollView{}.frame(maxHeight:).fixedSize()` 在里，整棵树再包一次
+`.frame(maxHeight:).fixedSize()` 在外。**
+
+**探针换 `contentViewController` 会量出一串假高度。** 已显示的 `NSPopover`
+换控制器**不重算尺寸**：内容高正确地变了（241→80），popover 停在旧值不动。
+所以 UI 探针必须「只 mount 一次，之后改绑定再量」——这既是真实 app 的路径
+（一个控制器活到底、靠 SwiftUI 驱动尺寸），也顺带把「面板缩不缩」变成可回归的。
+同理，`Engine` 五态要在**同一个实例**上切（`setProbePhase`），换实例就得换控制器。
+
+**SwiftUI 的无障碍树在进程内查不到，别为它写检查。** 没有辅助客户端连上来时，
+宿主视图的 `accessibilityChildren()` 返回 0 个子节点（布局却是好的）。
+想强制 materialize 的两条路都是死的：`AXUIElementCreateApplication(getpid())`
+查**自己**返回 `-25208`（`kAXErrorCannotComplete`，AX API 不能自查），
+设 `AXEnhancedUserInterface` 同样 `-25208`。同一段遍历代码对纯 AppKit 视图是好使的。
+**所以无障碍靠构造保证，不靠检查**：面板里的参数行只能由 `paramRow(title:value:help:)`
+生成，三个参数必填，漏不掉。听感仍然要人工过 VoiceOver。
+（附带一个更普遍的教训：第一版遍历写错找到 0 个控件，却因为「缺标签的也是 0 个」
+报了「✅ 全部通过」。**一个查不到东西的检查报通过，比没有这个检查更糟。**）
+
+**判断玻璃好不好看，不能用 `screencapture -l<windowID>` 抓的图。**
+按窗口号抓只合成那一个窗口，玻璃背后什么都没有、折射不出任何东西，
+于是退化成一块灰——拿这种图去比「嵌套玻璃 vs 着色填充」等于给玻璃判了个不公平的负
+（第一轮就是这么比的，玻璃看着像块洗白的板子）。改成 `-R<x,y,w,h>` 区域抓，
+把桌面一起带进来，才是用户真正看到的样子。换成区域抓之后结论反过来了，
+最终选了嵌套玻璃。**Apple 劝阻嵌套玻璃，但在这个面板上实测是好看的**——
+指导是默认值不是禁令，看了再定。
+
+**系统设置的深层链接锚点要从系统二进制里取，别抄。**
+「系统录音」是 `Privacy_AudioCapture`，和 `Privacy_Microphone` 是两个不同锚点：
+
+```
+x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AudioCapture
+```
+
+核对方法：`strings /System/Library/ExtensionKit/Extensions/SecurityPrivacyExtension.appex/Contents/MacOS/SecurityPrivacyExtension | grep -oE 'Privacy_[A-Za-z]+'`。
+**不能靠 `open` 试**——锚点写错时它照样返回 0，只是打开了错误的面板。
 
 **「丢档比例」不是感知指标。** 判据是最大**相对**亮度步进（韦伯定律）。
 高亮度区跳 3 档只有 2% 变化看不出来，档位 2 附近跳 3 档是 150% 一眼可见。
