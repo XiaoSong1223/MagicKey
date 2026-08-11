@@ -39,6 +39,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
     private var statusItem: NSStatusItem?
     private let popover = NSPopover()
     private var statusImages: [Bool: NSImage] = [:]
+    /// 面板显示期间对状态项窗口几何的订阅，见 `observeAnchorGeometry`
+    private var anchorObservers: [NSObjectProtocol] = []
 
     override init() {
         // 必须在 Engine() 之前——引擎构造时就会做崩溃恢复并输出日志，
@@ -148,14 +150,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
         // 面板能用多高，必须在 show 之前算好推给视图——视图那时还没有 window，
         // 自己判断不出会被摆到哪块屏。见 PanelMetrics 的注释。
         let barHeight = button.window?.frame.height
-        if buttonAnchorIsUsable(button) {
-            metrics.update(screen: button.window?.screen ?? clickedScreen(),
-                           statusBarHeight: barHeight)
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        if buttonAnchorIsUsable(button), let screen = button.window?.screen {
+            metrics.update(screen: screen,
+                           menuBar: PanelAnchor.menuBarHeight(on: screen,
+                                                              statusBarWindowHeight: barHeight))
+            // 定位矩形不是 button.bounds：纵向要钉在菜单栏下沿，
+            // 不能跟着状态项窗口的高度跑。理由见 PanelAnchor。
+            popover.show(relativeTo: PanelAnchor.positioningRect(for: button, on: screen),
+                         of: button, preferredEdge: .minY)
+            observeAnchorGeometry(of: button)
         } else {
             // 走鼠标兜底时面板会开在指针所在屏，高度也要按那块屏算
-            metrics.update(screen: clickedScreen() ?? NSScreen.main,
-                           statusBarHeight: barHeight)
+            let screen = clickedScreen() ?? NSScreen.main
+            metrics.update(screen: screen,
+                           menuBar: screen.map {
+                               PanelAnchor.menuBarHeight(on: $0, statusBarWindowHeight: barHeight)
+                           } ?? NSStatusBar.system.thickness)
             showPanelNearMouse(statusBarHeight: barHeight)
         }
         // 面板里全是滑块，打开就要能直接拖，所以得让本进程拿到焦点
@@ -178,6 +188,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
             win.initialFirstResponder = nil
             win.makeFirstResponder(nil)
         }
+    }
+
+    /// 面板开着的时候，状态项窗口的几何仍然可能被系统改（切 `activationPolicy`
+    /// 时菜单栏会重排）。`positioningRect` 是按 show 那一刻的几何算出来的，
+    /// 窗口一变它就过期了，面板会跟着挪。所以盯住这个窗口，变了就重钉一次。
+    ///
+    /// 只在面板显示期间订阅；`popoverDidClose` 里撤掉。
+    private func observeAnchorGeometry(of button: NSStatusBarButton) {
+        stopObservingAnchor()
+        guard let window = button.window else { return }
+        for name in [NSWindow.didResizeNotification, NSWindow.didMoveNotification] {
+            let token = NotificationCenter.default.addObserver(
+                forName: name, object: window, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, self.popover.isShown,
+                          let screen = button.window?.screen else { return }
+                    self.popover.positioningRect =
+                        PanelAnchor.positioningRect(for: button, on: screen)
+                }
+            }
+            anchorObservers.append(token)
+        }
+    }
+
+    private func stopObservingAnchor() {
+        anchorObservers.forEach(NotificationCenter.default.removeObserver)
+        anchorObservers.removeAll()
     }
 
     /// 按钮锚点能不能用：必须落在**用户刚点击的那块屏**上。
@@ -204,19 +242,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
         guard let screen = clickedScreen() ?? NSScreen.main else { return }
 
         let window = anchorWindow
-        // 贴着菜单栏下沿，水平对齐指针。普通 Space 里 visibleFrame.maxY
-        // 就是菜单栏下沿；但全屏 Space 里 visibleFrame == frame，直接用
-        // visibleFrame.maxY 会把整个 2pt 锚点放到屏幕外，NSPopover 随后会被
-        // 约束回主屏。用状态栏窗口的真实高度补回全屏时丢掉的上边距；
-        // NSStatusBar.thickness 只作为窗口不可用时的保底。
-        let menuBarHeight = max(statusBarHeight ?? 0, NSStatusBar.system.thickness)
-        let menuBarBottom = screen.frame.maxY - menuBarHeight
+        // 贴着菜单栏下沿，水平对齐指针。全屏 Space 里 visibleFrame == frame，
+        // 直接用 visibleFrame.maxY 会把整个 2pt 锚点放到屏幕外，NSPopover
+        // 随后会被约束回主屏——所以菜单栏高度统一走 PanelAnchor（它记着这块屏
+        // 在普通 Space 里量到的值，全屏时拿出来用）。
+        let menuBarBottom = PanelAnchor.menuBarBottom(on: screen,
+                                                      statusBarWindowHeight: statusBarHeight)
         let anchorSize = NSSize(width: 2, height: 2)
         let anchorX = min(max(mouse.x - anchorSize.width / 2, screen.frame.minX),
                           screen.frame.maxX - anchorSize.width)
         let anchorY = max(screen.frame.minY,
-                          min(min(screen.visibleFrame.maxY, menuBarBottom),
-                              screen.frame.maxY - anchorSize.height))
+                          min(menuBarBottom, screen.frame.maxY - anchorSize.height))
         window.setFrame(NSRect(origin: NSPoint(x: anchorX, y: anchorY), size: anchorSize),
                         display: false)
         window.orderFrontRegardless()
@@ -239,6 +275,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
 
     func popoverDidClose(_ notification: Notification) {
         anchorWindow.orderOut(nil)
+        stopObservingAnchor()
     }
 
     /// 打开设置窗口。面板是 `.transient` 的，窗口一拿到焦点它就自己关了——

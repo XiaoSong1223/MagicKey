@@ -270,9 +270,15 @@ enum UIProbe {
 
         func openPanel() {
             guard let b = item.button else { return }
-            metrics.update(screen: b.window?.screen ?? NSScreen.main,
-                           statusBarHeight: b.window?.frame.height)
-            popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
+            let screen = b.window?.screen ?? NSScreen.main
+            metrics.update(screen: screen,
+                           menuBar: screen.map {
+                               PanelAnchor.menuBarHeight(on: $0,
+                                                         statusBarWindowHeight: b.window?.frame.height)
+                           } ?? 33)
+            // 和 AppDelegate 走同一条定位路径，否则这里复现不出真实几何
+            let rect = screen.map { PanelAnchor.positioningRect(for: b, on: $0) } ?? b.bounds
+            popover.show(relativeTo: rect, of: b, preferredEdge: .minY)
             NSApp.activate()
         }
 
@@ -308,6 +314,109 @@ enum UIProbe {
         exit(0)
     }
 
+    // MARK: - 面板落点
+
+    /// 面板必须钉在菜单栏下沿，**状态项窗口的高度怎么变都不许动**。
+    ///
+    /// 这条必须自动化：真实症状（开关设置窗口之后面板上移一截，过一会儿又回去）
+    /// 取决于控制中心什么时候重新接管状态项，人工点击是碰运气；
+    /// 而几何本身完全确定——把「状态项窗口忽高忽低」直接造出来量就行。
+    ///
+    /// 造的是普通窗口而不是真 `NSStatusItem`：真状态项的高度归系统管，
+    /// 探针改不动它，也就没法制造那个坏状态。这里要验的是 `PanelAnchor` 的算术。
+    static func anchorChecks() -> [String] {
+        var failures: [String] = []
+        // 挑一块**普通 Space** 的屏：全屏 Space 里量不出菜单栏高度
+        guard let screen = NSScreen.screens.first(where: { $0.frame.maxY > $0.visibleFrame.maxY })
+                ?? NSScreen.main else { return ["拿不到屏幕"] }
+
+        let menuBar = PanelAnchor.menuBarHeight(on: screen)
+        let bottom = PanelAnchor.menuBarBottom(on: screen)
+        print("\n── 面板落点 ──")
+        print(String(format: "  屏 %.0f×%.0f，菜单栏 %.1fpt，下沿 y=%.1f",
+                     screen.frame.width, screen.frame.height, menuBar, bottom))
+
+        let win = NSWindow(contentRect: NSRect(x: screen.frame.midX, y: bottom,
+                                               width: 38, height: menuBar),
+                           styleMask: .borderless, backing: .buffered, defer: false)
+        win.isOpaque = false
+        win.backgroundColor = .clear
+        win.hasShadow = false
+        // 必须和真状态项同层。普通层的窗口会被 AppKit 挡在菜单栏下面
+        // （setFrame 会被 constrainFrameRect 往下推整整一个菜单栏高），
+        // 那样造出来的就不是「状态项窗口」而是别的东西，对照列全是错的。
+        win.level = .statusBar
+        let button = NSView(frame: NSRect(x: 0, y: 0, width: 38, height: menuBar))
+        win.contentView = button
+        win.orderFrontRegardless()
+
+        /// 定位矩形的底边落在屏幕的哪个 y——面板顶边贴的就是它
+        func top(_ rect: NSRect) -> CGFloat {
+            win.convertToScreen(button.convert(rect, to: nil)).minY
+        }
+
+        // 顶边始终贴屏幕上沿，只有高度变——这正是状态项被控制中心接管/放开时的样子。
+        // 第三种是「窗口被挪出所有屏幕」（全屏 Space），那时不该硬钉，见下。
+        let cases: [(name: String, y: CGFloat, height: CGFloat, pinned: Bool)] = [
+            ("托管中（高度=菜单栏）", screen.frame.maxY - menuBar, menuBar, true),
+            ("刚被放开（高度=22）", screen.frame.maxY - 22, 22, true),
+            ("挪出屏幕（全屏 Space）", screen.frame.maxY + 160, 30, false),
+        ]
+        for c in cases {
+            win.setFrame(NSRect(x: screen.frame.midX, y: c.y, width: 38, height: c.height),
+                         display: false)
+            let rect = PanelAnchor.positioningRect(for: button, on: screen)
+            let naive = top(button.bounds)                                    // 旧写法
+            let pinned = top(rect)
+            print(String(format: "  %-24@ button.bounds → y=%.1f（偏 %+.1f）；PanelAnchor → y=%.1f（偏 %+.1f）",
+                         c.name as NSString, naive, naive - bottom, pinned, pinned - bottom))
+
+            // ⚠️ 这条比「钉得准不准」更要紧：定位矩形一旦离开按钮 bounds，
+            // NSPopover **静默不显示**——面板压根不出现，比位移糟糕得多。
+            // 曾经真的写出过这个 bug（按钮在屏幕外时 dy=-189）。
+            if !rect.intersects(button.bounds) {
+                failures.append("定位矩形离开了按钮 bounds（\(c.name)），面板会打不开")
+            }
+            if c.pinned, abs(pinned - bottom) > 0.5 {
+                failures.append(String(format: "面板落点跑了 %.1fpt（%@）", pinned - bottom, c.name))
+            }
+        }
+        win.orderOut(nil)
+        return failures
+    }
+
+    /// 设置窗口每次打开都在屏幕正中
+    static func settingsCenterChecks(settings: Settings, updates: UpdateChecker) -> [String] {
+        print("\n── 设置窗口位置 ──")
+        SettingsWindowController.show(settings: settings, updates: updates)
+        settle(0.8)
+        guard let win = NSApp.windows.first(where: { $0.title == "MagicKey 设置" }) else {
+            return ["没找到设置窗口"]
+        }
+        defer { win.performClose(nil); settle(0.5) }
+
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
+        guard let visible = screen?.visibleFrame else { return ["拿不到屏幕"] }
+
+        let f = win.frame
+        let dx = f.midX - visible.midX, dy = f.midY - visible.midY
+        print(String(format: "  窗口 %.0f×%.0f 中心 (%.1f, %.1f)；可用区中心 (%.1f, %.1f)；偏差 (%+.1f, %+.1f)",
+                     f.width, f.height, f.midX, f.midY, visible.midX, visible.midY, dx, dy))
+        // 顺带把「按 fittingSize 定尺寸有没有留下空白/仍在滚动」摆出来。
+        // SettingsView 声明的是 minHeight 420 / idealHeight 560：
+        // AppKit 自己会取**最小值**开窗（内容一进来就滚动），取 fittingSize 才是理想高。
+        if let content = win.contentView {
+            let form = scrollContentHeight(in: content) ?? content.frame.height
+            print(String(format: "  内容区 %.0fpt，Form 理想高 %.0fpt → %@",
+                         content.frame.height, form,
+                         form > content.frame.height + 1 ? "仍在滚动"
+                             : form < content.frame.height - 1 ? "底部留白" : "正好放下"))
+        }
+        guard abs(dx) > 1 || abs(dy) > 1 else { return [] }
+        return [String(format: "设置窗口没居中，偏差 (%+.1f, %+.1f)", dx, dy)]
+    }
+
     // MARK: - 跑
 
     static func run() {
@@ -325,7 +434,7 @@ enum UIProbe {
         let audio = AudioStatusModel()
         let metrics = PanelMetrics()
         let engine = Engine(probe: .running)
-        metrics.update(screen: NSScreen.main, statusBarHeight: 33)
+        metrics.update(screen: NSScreen.main, menuBar: 33)
 
         print("MagicKey UI 探针")
         print("屏幕可用高度上限 = \(Int(metrics.maxHeight))pt"
@@ -451,6 +560,12 @@ enum UIProbe {
                       + (n.label.map { "  label=\($0)" } ?? ""))
             }
         }
+
+        // ── 7. 面板落点与设置窗口位置 ──────────────────────────────
+        // 放在最后：settingsCenterChecks 会把 activationPolicy 切成 .regular，
+        // 别让它影响前面那些尺寸测量。
+        failures += anchorChecks()
+        failures += settingsCenterChecks(settings: settings, updates: updates)
 
         // ── 汇总 ───────────────────────────────────────────────────
         print("\n── 汇总 ──")

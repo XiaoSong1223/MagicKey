@@ -86,7 +86,7 @@ xcrun --sdk macosx --show-sdk-version   # → 26.5
 | `Engine.Phase` 结构化状态（绿/灰/橙/红） | ✅ `status` 字符串原样保留 |
 | 音乐律动七态 `AudioStatus` | ✅ 含「没声音在放」与推断的「未授权」+ 跳转 |
 | `mainMenu` / ⌘Q | ✅ 之前 ⌘Q 完全无效（从未设过 mainMenu） |
-| UI 探针 `make probe-ui` | ✅ 高度/收缩/窄屏/五态/更新五态 |
+| UI 探针 `make probe-ui` | ✅ 高度/收缩/窄屏/五态/更新五态/面板落点/设置窗口居中 |
 | 状态还原 **六个时机** | ✅ 全部实测：正常退出、手动停止、崩溃重启、系统睡眠、SIGTERM、锁屏 |
 
 ### 性能实测（30 分钟长测，10.8 万帧）
@@ -400,6 +400,31 @@ ScrollView 上，最外层只剩 `.frame(maxHeight:)`——面板立刻变回只
 生成，三个参数必填，漏不掉。听感仍然要人工过 VoiceOver。
 （附带一个更普遍的教训：第一版遍历写错找到 0 个控件，却因为「缺标签的也是 0 个」
 报了「✅ 全部通过」。**一个查不到东西的检查报通过，比没有这个检查更糟。**）
+
+**面板的纵向位置别外包给状态项窗口的高度。** 把 `button.bounds` 直接交给
+`NSPopover` 最自然，但那等于让面板跟着状态项窗口的高度走——而这个高度**不由本进程决定**：
+控制中心托管时等于菜单栏（刘海屏 33 / 外接屏 30），没被托管时退化成 22。
+开关设置窗口会切一次 `activationPolicy`，菜单栏在那一刻重排，状态项窗口有一段时间是 22pt，
+底边比菜单栏下沿高 11pt，**面板就整体上移 11pt，等控制中心重新接管又自己回去**——
+用户报的「点开设置再关掉，面板往上跳了一下，过会儿又好了」就是它。
+解法在 `PanelAnchor`：纵向从屏幕几何推（`frame.maxY - visibleFrame.maxY`），横向仍取按钮。
+**健康时两种算法给出的是同一个数**（探针实测都是 923），所以这不是换位置，是把同一个位置钉死。
+面板开着时锚点窗口再变几何也要重钉一次（`positioningRect` 是 show 那一刻算的，会过期）。
+
+**定位矩形一旦离开按钮 bounds，`NSPopover` 静默不显示。** 不报错、不抛异常，
+面板压根不出现。上面那个修正量正常只有几 pt，但按钮窗口被挪到所有屏幕之外时
+（全屏 Space，见 `AppDelegate` 里那两种锚点失效）dy 会是 **-189**，矩形整个飞出按钮——
+探针里当场变成 `面板 y=nan`。修正之前先验交集，不成立就退回 `button.bounds`。
+**比原来那 11pt 的位移糟糕得多的失败模式，是自己新加的代码带来的**，探针第三个用例就为它而设。
+
+**`NSWindow(contentViewController:)` 装 SwiftUI 时，尺寸要等第一次布局才定得下来。**
+建完那一刻窗口是 **0×32**，拿它算居中，偏差正好是半个窗口（探针报过 `(+240, +210)`）。
+`window.layoutIfNeeded()` 不够——它不改窗口尺寸；要 `contentView.layoutSubtreeIfNeeded()`
+再按 `fittingSize` 设一次。顺带发现 AppKit 自己定的高度取的是 SwiftUI 声明里的
+**minHeight（420）而不是 idealHeight（560）**，所以设置窗口一开就在滚动，
+按 `fittingSize` 设完才是那个声明本来的意思。
+另外 **`NSWindow.center()` 不是正中**：只有水平居中，垂直方向刻意偏上
+（官方措辞 "somewhat above center"）。要正中就自己按 `visibleFrame` 算。
 
 **设置窗口里控件「看不清」，先查激活状态，别去调颜色。**
 `.accessory` 应用**无法可靠地自我激活**：`NSApp.activate(ignoringOtherApps:)`

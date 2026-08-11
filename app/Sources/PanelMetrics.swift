@@ -30,11 +30,11 @@ final class PanelMetrics: ObservableObject {
 
     /// - Parameters:
     ///   - screen: 面板实际会出现的那块屏
-    ///   - statusBarHeight: 状态栏窗口的真实高度。`NSStatusBar.system.thickness`
-    ///     本机返回 22pt，而刘海屏/外接屏的实际菜单栏是 33/30pt——只拿它保底。
-    func update(screen: NSScreen?, statusBarHeight: CGFloat?) {
+    ///   - menuBar: 那块屏的菜单栏高度。**由 `PanelAnchor.menuBarHeight` 给出**——
+    ///     面板顶边贴的就是这条线，高度上限必须和它用同一个数，否则算出来的
+    ///     可用高度和面板实际的落点对不上。
+    func update(screen: NSScreen?, menuBar: CGFloat) {
         guard let screen else { return }
-        let menuBar = max(statusBarHeight ?? 0, NSStatusBar.system.thickness)
 
         // 普通 Space：visibleFrame 已经扣掉了菜单栏和 Dock，直接可用。
         // 全屏 Space：visibleFrame == frame，扣不掉菜单栏，得自己减。

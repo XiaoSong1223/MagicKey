@@ -25,13 +25,53 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         window.title = "MagicKey 设置"
         window.styleMask = [.titled, .closable, .miniaturizable]
         window.isReleasedWhenClosed = false      // 关掉之后还要能再打开
-        window.center()
-        window.setFrameAutosaveName("MagicKey.Settings")
 
         let controller = SettingsWindowController(window: window)
         window.delegate = controller
         shared = controller
+        controller.centerOnActiveScreen()
         controller.bringToFront()
+    }
+
+    /// 摆到目标屏的**正中**。
+    ///
+    /// 不用 `NSWindow.center()`：它只有水平方向是居中的，垂直方向刻意偏上
+    /// （官方措辞是「somewhat above center」），并排看一眼就知道不是正中间。
+    ///
+    /// 也不用 `setFrameAutosaveName`：那会把上次拖到的位置记进 defaults，
+    /// 下次打开就不在中间了——而这个窗口是关掉即销毁的单例，每次打开都是
+    /// 「重新出现」，出现在正中比出现在上次的位置更符合预期。
+    ///
+    /// 目标屏取**指针所在的那块**：用户刚在面板里点完「设置」，指针就停在那儿。
+    /// 和 `AppDelegate.clickedScreen()` 是同一个判据。
+    private func centerOnActiveScreen() {
+        guard let window else { return }
+
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
+        guard let visible = screen?.visibleFrame else { window.center(); return }
+
+        // ⚠️ **先把尺寸定下来再居中。** `NSWindow(contentViewController:)` 建出来的
+        // 窗口在 SwiftUI 跑完第一次布局之前是空的（探针实测：那一刻 frame 是 0×32）。
+        // 拿 0×32 去算居中，偏差正好是半个窗口——探针报过 (+240, +210)。
+        // `layoutIfNeeded()` 不够，它不改窗口尺寸，得自己按 fittingSize 设一次。
+        //
+        // 顺带修掉另一件事：AppKit 自己定的窗口高度取的是 `SettingsView` 声明的
+        // **minHeight（420）**，一开窗内容就在滚动；`fittingSize` 给的是
+        // idealHeight（560），才是那个声明本来的意思。
+        if let content = window.contentView {
+            content.layoutSubtreeIfNeeded()
+            var fitting = content.fittingSize
+            if fitting.width > 1, fitting.height > 1 {
+                // 矮屏上别顶满：留 48pt 给窗口投影和上下呼吸
+                fitting.height = min(fitting.height, visible.height - 48)
+                window.setContentSize(fitting)
+            }
+        }
+
+        let size = window.frame.size
+        window.setFrameOrigin(NSPoint(x: (visible.midX - size.width / 2).rounded(),
+                                      y: (visible.midY - size.height / 2).rounded()))
     }
 
     /// **必须先切成 `.regular` 再激活。**
