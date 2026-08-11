@@ -59,12 +59,21 @@ enum UIProbe {
                       audio: AudioStatusModel, metrics: PanelMetrics) {
         let view = MenuBarView(settings: settings, engine: engine, updates: updates,
                                audio: audio, metrics: metrics)
+        // 必须先关掉：给已显示的 popover 换控制器不会重算尺寸，
+        // 后面量到的会是上一次 mount 的旧尺寸（这个坑本文件上面刚记过一次）。
+        if popover.isShown { popover.performClose(nil); settle(0.3) }
         popover.contentViewController = NSHostingController(rootView: view)
         popover.behavior = .applicationDefined
         if let anchorView = anchor.contentView {
             popover.show(relativeTo: anchorView.bounds, of: anchorView, preferredEdge: .maxY)
         }
-        settle(0.4)
+        // 和 AppDelegate.clearInitialFocus 保持一致——否则这里测不出那个回归
+        DispatchQueue.main.async {
+            guard let w = popover.contentViewController?.view.window else { return }
+            w.initialFirstResponder = nil
+            w.makeFirstResponder(nil)
+        }
+        settle(0.5)
     }
 
     /// 量当前面板。
@@ -175,13 +184,20 @@ enum UIProbe {
         if dark { NSApp.appearance = NSAppearance(named: .darkAqua) }
 
         let settings = Settings()
-        settings.kind = .breathe          // 选中态要看得见，随便挑一个非首项
+        let a = ProcessInfo.processInfo.arguments
+        settings.kind = (a.firstIndex(of: "--effect").map { a[$0 + 1] })
+            .flatMap(EffectKind.init(rawValue:)) ?? .breathe
         mount(settings: settings,
               engine: Engine(probe: .running),
               updates: UpdateChecker(),
               audio: AudioStatusModel(),
               metrics: PanelMetrics())
         settle(0.6)
+        // 验证「拖滑块时右侧数值跟着变」：程序化改 hi，看输入框认不认
+        if let i = a.firstIndex(of: "--hi"), i + 1 < a.count, let v = Double(a[i + 1]) {
+            settings.hi = v
+            settle(0.5)
+        }
 
         guard let win = popover.contentViewController?.view.window else {
             print("❌ 拿不到 popover 窗口"); exit(1)
@@ -202,10 +218,104 @@ enum UIProbe {
         exit(p.terminationStatus)
     }
 
+    /// 截设置窗口。`--shot-settings <path> [--dark]`
+    static func shootSettings(to path: String, dark: Bool) {
+        if dark { NSApp.appearance = NSAppearance(named: .darkAqua) }
+        let settings = Settings()
+        settings.kind = .breathe
+        SettingsWindowController.show(settings: settings, updates: UpdateChecker())
+        settle(0.8)
+        guard let win = NSApp.windows.first(where: { $0.title == "MagicKey 设置" }) else {
+            print("❌ 没找到设置窗口"); exit(1)
+        }
+        print("  NSApp.isActive       = \(NSApp.isActive)")
+        print("  window.isKeyWindow   = \(win.isKeyWindow)")
+        print("  window.isMainWindow  = \(win.isMainWindow)")
+        print("  window.canBecomeKey  = \(win.canBecomeKey)")
+        print("  activationPolicy     = \(NSApp.activationPolicy().rawValue) (0=regular 1=accessory 2=prohibited)")
+        let f = win.frame
+        let top = NSScreen.screens.first?.frame.maxY ?? f.maxY
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        p.arguments = ["-x", "-R\(Int(f.minX)),\(Int(top - f.maxY)),\(Int(f.width)),\(Int(f.height))",
+                       path]
+        try? p.run(); p.waitUntilExit()
+        print("\(path)  (\(dark ? "深色" : "浅色"))")
+        exit(0)
+    }
+
+    // MARK: - 复现：开关设置窗口之后面板跑位
+
+    /// 用户报告：点开设置界面再关闭，然后点状态栏图标，面板整体向上移动，
+    /// 过一会儿又恢复。这里把这个序列走一遍，逐帧记面板窗口和内容的几何。
+    static func reproSettings() {
+        let settings = Settings()
+        let updates = UpdateChecker()
+        let engine = Engine(probe: .running)
+        let metrics = PanelMetrics()
+        settings.kind = .breathe
+
+        // 必须用**真的 NSStatusItem**：用普通窗口当锚点复现不出来（试过）。
+        // 差别就在状态项——它的宿主窗口归菜单栏管，几何会被系统改。
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item.button?.image = NSImage(systemSymbolName: "keyboard",
+                                     accessibilityDescription: "probe")
+        item.button?.image?.isTemplate = true
+        settle(0.5)
+
+        popover.contentViewController = NSHostingController(
+            rootView: MenuBarView(settings: settings, engine: engine, updates: updates,
+                                  audio: AudioStatusModel(), metrics: metrics))
+        popover.behavior = .transient
+
+        func openPanel() {
+            guard let b = item.button else { return }
+            metrics.update(screen: b.window?.screen ?? NSScreen.main,
+                           statusBarHeight: b.window?.frame.height)
+            popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
+            NSApp.activate()
+        }
+
+        func snapshot(_ tag: String) {
+            let root = popover.contentViewController?.view
+            let win = root?.window
+            let bw = item.button?.window
+            print(String(format: "  %-20@ 面板 y=%7.1f h=%6.1f | 按钮窗 y=%7.1f h=%5.1f | 内容 h=%.0f",
+                         tag as NSString,
+                         win?.frame.origin.y ?? -1, win?.frame.height ?? -1,
+                         bw?.frame.origin.y ?? -1, bw?.frame.height ?? -1,
+                         root?.frame.height ?? -1))
+        }
+
+        print("\n── 复现：设置窗口开关前后的面板几何 ──")
+        print("（面板 y 是窗口左下角；变大 = 面板整体上移）")
+
+        openPanel(); settle(0.6); snapshot("① 首次打开")
+        popover.performClose(nil); settle(0.4)
+        openPanel(); settle(0.6); snapshot("② 关掉再开（对照）")
+
+        SettingsWindowController.show(settings: settings, updates: updates)
+        settle(1.0); snapshot("③ 设置窗口开着")
+        NSApp.windows.first { $0.title == "MagicKey 设置" }?.performClose(nil)
+        settle(1.0); snapshot("④ 设置刚关掉")
+
+        popover.performClose(nil); settle(0.4)
+        openPanel()
+        for t in [0.5, 1.5, 2.5, 4.5, 7.5] {
+            settle(t == 0.5 ? 0.5 : 1.0)
+            snapshot("⑤ 重开 +\(t)s")
+        }
+        exit(0)
+    }
+
     // MARK: - 跑
 
     static func run() {
         let args = ProcessInfo.processInfo.arguments
+        if args.contains("--repro-settings") { reproSettings() }
+        if let i = args.firstIndex(of: "--shot-settings"), i + 1 < args.count {
+            shootSettings(to: args[i + 1], dark: args.contains("--dark"))
+        }
         if let i = args.firstIndex(of: "--shot"), i + 1 < args.count {
             shoot(to: args[i + 1], dark: args.contains("--dark"))
         }
@@ -312,6 +422,23 @@ enum UIProbe {
             if !ok { failures.append("更新状态「\(name)」撑宽了 Footer") }
         }
         updates.setProbeState(.idle)
+
+        // ── 5b. 初始焦点：**只打印，不作判据** ────────────────────────
+        //
+        // 「打开面板时亮度输入框不该自动获得焦点」这条探针**测不了**。
+        // 阴性对照：把 AppDelegate 那段 clearInitialFocus 从探针里去掉，
+        // 甚至再补一次 window.makeKey()，firstResponder 照样停在
+        // _NSPopoverWindow，报「✅」——因为探针进程从后台 shell 起，
+        // 应用不活跃，AppKit 根本没走到指派 initial first responder 那一步。
+        //
+        // 所以这里只打印观测值。**不要把它加回 failures**：
+        // 一个查不到东西的检查报通过，比没有这个检查更糟（本文件上面已经栽过一次）。
+        print("\n── 初始焦点（信息性，探针测不了，见注释）──")
+        settings.kind = .breathe
+        _ = measure(label: "focus", metrics: metrics)
+        let fr = popover.contentViewController?.view.window?.firstResponder
+        print("  firstResponder = \(fr.map { "\(type(of: $0))" } ?? "nil")"
+              + "   （真机验证：点开状态栏，亮度框不该有光标）")
 
         // ── 6. 无障碍（信息性，判据见注释）──────────────────────────
         let nodes = accessibilityTree(of: popover.contentViewController?.view)

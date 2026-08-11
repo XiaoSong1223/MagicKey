@@ -160,6 +160,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
         }
         // 面板里全是滑块，打开就要能直接拖，所以得让本进程拿到焦点
         NSApp.activate()
+        clearInitialFocus()
+    }
+
+    /// 打开面板时**不要**让亮度输入框自动获得焦点。
+    ///
+    /// `NSPopover` 的窗口会按 AppKit 惯例把第一个可编辑文本框设成
+    /// initial first responder。面板里只有亮度那一个输入框，于是每次点开状态栏
+    /// 都直接进了输入态：光标在闪、背景高亮，看着像出了什么事，
+    /// 而用户九成是来拖滑块或换效果的。
+    ///
+    /// 清掉之后输入框仍然点得进去，Tab 也照样能走到它。
+    private func clearInitialFocus() {
+        // show() 之后窗口才存在，推迟一个 runloop
+        DispatchQueue.main.async { [weak self] in
+            guard let win = self?.popover.contentViewController?.view.window else { return }
+            win.initialFirstResponder = nil
+            win.makeFirstResponder(nil)
+        }
     }
 
     /// 按钮锚点能不能用：必须落在**用户刚点击的那块屏**上。
