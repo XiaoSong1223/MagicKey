@@ -3,7 +3,7 @@
   <h1>MagicKey</h1>
   <p>让 MacBook 内置键盘背光随呼吸、敲击与音乐流动。</p>
   <p>
-    <img src="https://img.shields.io/badge/version-v0.5-B8D2FF?style=flat-square" alt="版本 v0.5">
+    <img src="https://img.shields.io/badge/version-v0.6-B8D2FF?style=flat-square" alt="版本 v0.6">
     <img src="https://img.shields.io/badge/macOS-14%2B-171A20?style=flat-square&logo=apple&logoColor=white" alt="macOS 14+">
     <img src="https://img.shields.io/badge/Apple%20Silicon-required-303640?style=flat-square&logo=apple&logoColor=white" alt="需要 Apple Silicon">
     <img src="https://img.shields.io/badge/Swift-5-F05138?style=flat-square&logo=swift&logoColor=white" alt="Swift 5">
