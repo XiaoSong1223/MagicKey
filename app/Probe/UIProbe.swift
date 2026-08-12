@@ -62,7 +62,12 @@ enum UIProbe {
         // 必须先关掉：给已显示的 popover 换控制器不会重算尺寸，
         // 后面量到的会是上一次 mount 的旧尺寸（这个坑本文件上面刚记过一次）。
         if popover.isShown { popover.performClose(nil); settle(0.3) }
-        popover.contentViewController = NSHostingController(rootView: view)
+        // 必须和 app 用同一个宿主控制器。它会把 SwiftUI 的尺寸同步给
+        // NSPopover.contentSize，而那正是「面板缩不缩」这条检查要覆盖的东西——
+        // 用裸 NSHostingController 等于测了个和线上不一样的配置。
+        let host = PanelHostingController(rootView: view)
+        host.popover = popover
+        popover.contentViewController = host
         popover.behavior = .applicationDefined
         if let anchorView = anchor.contentView {
             popover.show(relativeTo: anchorView.bounds, of: anchorView, preferredEdge: .maxY)
@@ -381,6 +386,57 @@ enum UIProbe {
                 failures.append(String(format: "面板落点跑了 %.1fpt（%@）", pinned - bottom, c.name))
             }
         }
+        // ── 真的开一次面板，量用户实际看到的那块玻璃在哪 ────────────────
+        //
+        // 上面验的是「交给 NSPopover 的矩形对不对」，但用户看到的是**内容视图**，
+        // 中间还隔着 NSPopover 自己的定位。那一层真的会骗人：`contentSize`
+        // 不同步时面板整体右移下移各 20pt（见 PanelHostingController），
+        // 而定位矩形一个字都没错。所以判据必须落在内容视图的屏幕坐标上。
+        win.setFrame(NSRect(x: screen.frame.midX, y: screen.frame.maxY - menuBar,
+                            width: 38, height: menuBar), display: false)
+        let settings = Settings()
+        settings.kind = .breathe
+        let metrics = PanelMetrics()
+        metrics.update(screen: screen, menuBar: menuBar)
+        let po = NSPopover()
+        po.behavior = .applicationDefined
+        let host = PanelHostingController(
+            rootView: MenuBarView(settings: settings, engine: Engine(probe: .running),
+                                  updates: UpdateChecker(), audio: AudioStatusModel(),
+                                  metrics: metrics))
+        host.popover = po
+        po.contentViewController = host
+        host.syncContentSize()
+        po.show(relativeTo: PanelAnchor.positioningRect(for: button, on: screen),
+                of: button, preferredEdge: .minY)
+        settle(0.6)
+
+        let iconCenter = win.frame.midX
+        /// popover 窗口四周有一圈透明边距（箭头画在里面），所以判据是**内容视图**
+        func panelRect() -> NSRect? {
+            guard let cv = po.contentViewController?.view, let pw = cv.window else { return nil }
+            return pw.convertToScreen(cv.convert(cv.bounds, to: nil))
+        }
+        for (tag, effect) in [("呼吸", EffectKind.breathe), ("换成音乐", .audioBeat)] {
+            settings.kind = effect
+            settle(0.6)
+            guard let r = panelRect() else { failures.append("面板没显示出来"); break }
+            print(String(format: "  %-8@ 面板 %.0f×%.0f  中心 x=%.1f（图标 %.1f，差 %+.1f）  顶边 y=%.1f（菜单栏下沿 %.1f，差 %+.1f）",
+                         tag as NSString, r.width, r.height,
+                         r.midX, iconCenter, r.midX - iconCenter,
+                         r.maxY, bottom, r.maxY - bottom))
+            if abs(r.midX - iconCenter) > 1 {
+                failures.append(String(format: "面板没在图标正下方，偏 %+.1fpt（%@）", r.midX - iconCenter, tag))
+            }
+            // 内容顶边比菜单栏下沿低一点是正常的：popover 窗口的透明边距（箭头在里面）。
+            // 实测 13pt。放宽到 16pt，超了说明真的掉下来了。
+            let gap = bottom - r.maxY
+            if gap < 0 || gap > 16 {
+                failures.append(String(format: "面板顶边离菜单栏 %.1fpt（%@）", gap, tag))
+            }
+        }
+        po.performClose(nil)
+        settle(0.3)
         win.orderOut(nil)
         return failures
     }

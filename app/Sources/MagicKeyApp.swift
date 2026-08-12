@@ -38,6 +38,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
 
     private var statusItem: NSStatusItem?
     private let popover = NSPopover()
+    /// 面板的宿主，show 之前要叫它同步一次尺寸，见 `PanelHostingController`
+    private var panelHost: (any PanelSizeSyncing)?
     private var statusImages: [Bool: NSImage] = [:]
     /// 面板显示期间对状态项窗口几何的订阅，见 `observeAnchorGeometry`
     private var anchorObservers: [NSObjectProtocol] = []
@@ -110,10 +112,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
     private func setUpMenuBar() {
         popover.behavior = .transient          // 点面板外面就关，和菜单一致
         popover.delegate = self
-        popover.contentViewController = NSHostingController(
+        // 用 PanelHostingController 而不是裸 NSHostingController：
+        // NSPopover 靠 contentSize 定位，而它不会自己跟着 SwiftUI 的尺寸走，
+        // 不同步的话面板会整体右移下移各 20pt。理由见那个类的注释。
+        let host = PanelHostingController(
             rootView: MenuBarView(settings: settings, engine: engine, updates: updates,
                                   audio: audio, metrics: metrics,
                                   openSettings: { [weak self] in self?.openSettings() }))
+        host.popover = popover
+        popover.contentViewController = host
+        panelHost = host
 
         // autosaveName 让菜单栏位置在重装/重建之间稳定下来。**别再往这里加
         // 「修复可见性」的代码**：图标不显示是控制中心按 bundle id 把它记进了
@@ -154,6 +162,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
             metrics.update(screen: screen,
                            menuBar: PanelAnchor.menuBarHeight(on: screen,
                                                               statusBarWindowHeight: barHeight))
+            // 必须在 show 之前——定位就发生在 show 那一刻，晚一帧面板就偏了
+            panelHost?.syncContentSize()
             // 定位矩形不是 button.bounds：纵向要钉在菜单栏下沿，
             // 不能跟着状态项窗口的高度跑。理由见 PanelAnchor。
             popover.show(relativeTo: PanelAnchor.positioningRect(for: button, on: screen),
@@ -166,6 +176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
                            menuBar: screen.map {
                                PanelAnchor.menuBarHeight(on: $0, statusBarWindowHeight: barHeight)
                            } ?? NSStatusBar.system.thickness)
+            panelHost?.syncContentSize()
             showPanelNearMouse(statusBarHeight: barHeight)
         }
         // 面板里全是滑块，打开就要能直接拖，所以得让本进程拿到焦点
