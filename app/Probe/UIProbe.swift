@@ -46,6 +46,9 @@ enum UIProbe {
 
     private static let popover = NSPopover()
 
+    /// `--repro-settings` 用的锚点窗口，和 app 里那个同款
+    private static let reproAnchor: NSWindow = PanelAnchor.makeAnchorWindow()
+
     /// 让 SwiftUI 把布局跑完。改完绑定之后必须转几圈 runloop，
     /// 否则量到的是**上一帧**的尺寸——这会让整个探针安静地报出错误数字。
     private static func settle(_ seconds: TimeInterval = 0.25) {
@@ -282,8 +285,12 @@ enum UIProbe {
                                                          statusBarWindowHeight: b.window?.frame.height)
                            } ?? 33)
             // 和 AppDelegate 走同一条定位路径，否则这里复现不出真实几何
-            let rect = screen.map { PanelAnchor.positioningRect(for: b, on: $0) } ?? b.bounds
-            popover.show(relativeTo: rect, of: b, preferredEdge: .minY)
+            guard let s = screen,
+                  let anchorView = PanelAnchor.place(reproAnchor, centerX: b.window?.frame.midX ?? 0,
+                                                     on: s,
+                                                     statusBarWindowHeight: b.window?.frame.height)
+            else { return }
+            popover.show(relativeTo: anchorView.bounds, of: anchorView, preferredEdge: .minY)
             NSApp.activate()
         }
 
@@ -321,14 +328,18 @@ enum UIProbe {
 
     // MARK: - 面板落点
 
-    /// 面板必须钉在菜单栏下沿，**状态项窗口的高度怎么变都不许动**。
+    /// 面板必须落在**图标正下方、贴着菜单栏下沿**，而且
+    /// **系统怎么折腾状态项窗口都不许动**。
     ///
-    /// 这条必须自动化：真实症状（开关设置窗口之后面板上移一截，过一会儿又回去）
-    /// 取决于控制中心什么时候重新接管状态项，人工点击是碰运气；
-    /// 而几何本身完全确定——把「状态项窗口忽高忽低」直接造出来量就行。
+    /// 这一组必须自动化：三个真实症状（开关设置窗口后上移 11pt、整体右移下移
+    /// 各 20pt、全屏下菜单栏一收面板闪到左上角）人工点击全靠碰运气复现，
+    /// 而它们的成因都是确定的几何——把状态项窗口的坏状态直接造出来量就行。
     ///
-    /// 造的是普通窗口而不是真 `NSStatusItem`：真状态项的高度归系统管，
-    /// 探针改不动它，也就没法制造那个坏状态。这里要验的是 `PanelAnchor` 的算术。
+    /// 造的是普通窗口而不是真 `NSStatusItem`：真状态项的几何归系统管，
+    /// 探针改不动它，也就没法制造那些坏状态。
+    ///
+    /// ⚠️ 判据落在**内容视图的屏幕坐标**上，不是定位矩形。那一层真的会骗人：
+    /// `contentSize` 不同步时面板整体偏 20pt，而定位矩形一个字都没错。
     static func anchorChecks() -> [String] {
         var failures: [String] = []
         // 挑一块**普通 Space** 的屏：全屏 Space 里量不出菜单栏高度
@@ -341,59 +352,20 @@ enum UIProbe {
         print(String(format: "  屏 %.0f×%.0f，菜单栏 %.1fpt，下沿 y=%.1f",
                      screen.frame.width, screen.frame.height, menuBar, bottom))
 
-        let win = NSWindow(contentRect: NSRect(x: screen.frame.midX, y: bottom,
-                                               width: 38, height: menuBar),
-                           styleMask: .borderless, backing: .buffered, defer: false)
-        win.isOpaque = false
-        win.backgroundColor = .clear
-        win.hasShadow = false
-        // 必须和真状态项同层。普通层的窗口会被 AppKit 挡在菜单栏下面
-        // （setFrame 会被 constrainFrameRect 往下推整整一个菜单栏高），
-        // 那样造出来的就不是「状态项窗口」而是别的东西，对照列全是错的。
-        win.level = .statusBar
-        let button = NSView(frame: NSRect(x: 0, y: 0, width: 38, height: menuBar))
-        win.contentView = button
-        win.orderFrontRegardless()
+        // 冒充状态项的窗口。必须和真状态项同层：普通层的窗口会被 AppKit 的
+        // constrainFrameRect 挡在菜单栏下面（整整推下来一个菜单栏高），
+        // 那样造出来的就不是「状态项窗口」而是别的东西。
+        let item = NSWindow(contentRect: NSRect(x: screen.frame.midX, y: bottom,
+                                                width: 38, height: menuBar),
+                            styleMask: .borderless, backing: .buffered, defer: false)
+        item.isOpaque = false
+        item.backgroundColor = .clear
+        item.hasShadow = false
+        item.level = .statusBar
+        item.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 38, height: menuBar))
+        item.orderFrontRegardless()
+        let iconCenter = item.frame.midX
 
-        /// 定位矩形的底边落在屏幕的哪个 y——面板顶边贴的就是它
-        func top(_ rect: NSRect) -> CGFloat {
-            win.convertToScreen(button.convert(rect, to: nil)).minY
-        }
-
-        // 顶边始终贴屏幕上沿，只有高度变——这正是状态项被控制中心接管/放开时的样子。
-        // 第三种是「窗口被挪出所有屏幕」（全屏 Space），那时不该硬钉，见下。
-        let cases: [(name: String, y: CGFloat, height: CGFloat, pinned: Bool)] = [
-            ("托管中（高度=菜单栏）", screen.frame.maxY - menuBar, menuBar, true),
-            ("刚被放开（高度=22）", screen.frame.maxY - 22, 22, true),
-            ("挪出屏幕（全屏 Space）", screen.frame.maxY + 160, 30, false),
-        ]
-        for c in cases {
-            win.setFrame(NSRect(x: screen.frame.midX, y: c.y, width: 38, height: c.height),
-                         display: false)
-            let rect = PanelAnchor.positioningRect(for: button, on: screen)
-            let naive = top(button.bounds)                                    // 旧写法
-            let pinned = top(rect)
-            print(String(format: "  %-24@ button.bounds → y=%.1f（偏 %+.1f）；PanelAnchor → y=%.1f（偏 %+.1f）",
-                         c.name as NSString, naive, naive - bottom, pinned, pinned - bottom))
-
-            // ⚠️ 这条比「钉得准不准」更要紧：定位矩形一旦离开按钮 bounds，
-            // NSPopover **静默不显示**——面板压根不出现，比位移糟糕得多。
-            // 曾经真的写出过这个 bug（按钮在屏幕外时 dy=-189）。
-            if !rect.intersects(button.bounds) {
-                failures.append("定位矩形离开了按钮 bounds（\(c.name)），面板会打不开")
-            }
-            if c.pinned, abs(pinned - bottom) > 0.5 {
-                failures.append(String(format: "面板落点跑了 %.1fpt（%@）", pinned - bottom, c.name))
-            }
-        }
-        // ── 真的开一次面板，量用户实际看到的那块玻璃在哪 ────────────────
-        //
-        // 上面验的是「交给 NSPopover 的矩形对不对」，但用户看到的是**内容视图**，
-        // 中间还隔着 NSPopover 自己的定位。那一层真的会骗人：`contentSize`
-        // 不同步时面板整体右移下移各 20pt（见 PanelHostingController），
-        // 而定位矩形一个字都没错。所以判据必须落在内容视图的屏幕坐标上。
-        win.setFrame(NSRect(x: screen.frame.midX, y: screen.frame.maxY - menuBar,
-                            width: 38, height: menuBar), display: false)
         let settings = Settings()
         settings.kind = .breathe
         let metrics = PanelMetrics()
@@ -407,24 +379,26 @@ enum UIProbe {
         host.popover = po
         po.contentViewController = host
         host.syncContentSize()
-        po.show(relativeTo: PanelAnchor.positioningRect(for: button, on: screen),
-                of: button, preferredEdge: .minY)
+
+        // 走和 app 完全相同的落点计算
+        let anchorWindow = PanelAnchor.makeAnchorWindow()
+        guard let anchorView = PanelAnchor.place(anchorWindow, centerX: iconCenter, on: screen,
+                                                 statusBarWindowHeight: item.frame.height) else {
+            return ["锚点窗口没建起来"]
+        }
+        po.show(relativeTo: anchorView.bounds, of: anchorView, preferredEdge: .minY)
         settle(0.6)
 
-        let iconCenter = win.frame.midX
-        /// popover 窗口四周有一圈透明边距（箭头画在里面），所以判据是**内容视图**
+        /// popover 窗口四周有一圈透明边距（箭头画在里面），所以量**内容视图**
         func panelRect() -> NSRect? {
             guard let cv = po.contentViewController?.view, let pw = cv.window else { return nil }
             return pw.convertToScreen(cv.convert(cv.bounds, to: nil))
         }
-        for (tag, effect) in [("呼吸", EffectKind.breathe), ("换成音乐", .audioBeat)] {
-            settings.kind = effect
-            settle(0.6)
-            guard let r = panelRect() else { failures.append("面板没显示出来"); break }
-            print(String(format: "  %-8@ 面板 %.0f×%.0f  中心 x=%.1f（图标 %.1f，差 %+.1f）  顶边 y=%.1f（菜单栏下沿 %.1f，差 %+.1f）",
+        func check(_ tag: String) -> NSRect? {
+            guard let r = panelRect() else { failures.append("面板没显示出来（\(tag)）"); return nil }
+            print(String(format: "  %-26@ 面板 %.0f×%.0f  中心 x=%.1f（图标 %.1f，差 %+.1f）  顶边 y=%.1f（菜单栏下沿差 %+.1f）",
                          tag as NSString, r.width, r.height,
-                         r.midX, iconCenter, r.midX - iconCenter,
-                         r.maxY, bottom, r.maxY - bottom))
+                         r.midX, iconCenter, r.midX - iconCenter, r.maxY, r.maxY - bottom))
             if abs(r.midX - iconCenter) > 1 {
                 failures.append(String(format: "面板没在图标正下方，偏 %+.1fpt（%@）", r.midX - iconCenter, tag))
             }
@@ -434,10 +408,39 @@ enum UIProbe {
             if gap < 0 || gap > 16 {
                 failures.append(String(format: "面板顶边离菜单栏 %.1fpt（%@）", gap, tag))
             }
+            return r
         }
+
+        guard let baseline = check("① 图标正下方") else { return failures }
+
+        // ② 换效果重新布局（300 → 355pt）：只许往下长，落点不许动
+        settings.kind = .audioBeat
+        settle(0.6)
+        _ = check("② 换成音乐（内容变高）")
+
+        // ③④ 系统折腾状态项窗口。**面板一个像素都不许动。**
+        //   ③ 高度退化成 22 —— 控制中心放开托管时就是这样（切 activationPolicy 会触发）
+        //   ④ 挪出所有屏幕 —— 全屏 Space 里菜单栏自动收起时就是这样
+        for (tag, frame) in [
+            ("③ 状态项缩成 22pt", NSRect(x: screen.frame.midX, y: screen.frame.maxY - 22,
+                                          width: 38, height: 22)),
+            ("④ 状态项挪出屏幕", NSRect(x: screen.frame.midX, y: screen.frame.maxY + 160,
+                                          width: 38, height: 30)),
+        ] {
+            item.setFrame(frame, display: false)
+            settle(0.5)
+            guard let r = check(tag) else { continue }
+            // 和基线逐点比：这四步里面板本来就该纹丝不动（②只是变高，顶边和中心不变）
+            if abs(r.midX - baseline.midX) > 0.5 || abs(r.maxY - baseline.maxY) > 0.5 {
+                failures.append(String(format: "状态项一动面板就跟着跑了（%@，Δ%.1f, %.1f）",
+                                       tag, r.midX - baseline.midX, r.maxY - baseline.maxY))
+            }
+        }
+
         po.performClose(nil)
         settle(0.3)
-        win.orderOut(nil)
+        anchorWindow.orderOut(nil)
+        item.orderOut(nil)
         return failures
     }
 

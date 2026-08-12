@@ -62,26 +62,52 @@ enum PanelAnchor {
     ///
     /// 面板开着的时候如果锚点窗口的几何变了，这个矩形就过期了——
     /// 调用方要盯着窗口的 move/resize 重算一次，见 `AppDelegate.observeAnchorGeometry`。
-    static func positioningRect(for button: NSView, on screen: NSScreen) -> NSRect {
-        guard let window = button.window else { return button.bounds }
-        let onScreen = window.convertToScreen(button.convert(button.bounds, to: nil))
-        let dy = menuBarBottom(on: screen, statusBarWindowHeight: window.frame.height)
-               - onScreen.minY
-        // NSView 默认 y 向上，翻转过的视图要反号。NSStatusBarButton 不翻转，
-        // 但这里不该依赖那个实现细节。
-        let rect = button.bounds.offsetBy(dx: 0, dy: button.isFlipped ? -dy : dy)
+    /// 造一个当锚点用的透明小窗口。
+    ///
+    /// `NSPopover.show(relativeTo:of:)` 只认视图、不收裸矩形，所以必须有个真窗口。
+    /// `.statusBar` 层 + `canJoinAllSpaces` / `fullScreenAuxiliary`，
+    /// 否则它进不了全屏空间，面板也就跟着开不出来。
+    static func makeAnchorWindow() -> NSWindow {
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 2, height: 2),
+                         styleMask: .borderless, backing: .buffered, defer: false)
+        w.isOpaque = false
+        w.backgroundColor = .clear
+        w.hasShadow = false
+        w.level = .statusBar
+        w.ignoresMouseEvents = true
+        w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        w.contentView = NSView()
+        return w
+    }
 
-        // ⚠️ **定位矩形必须和按钮 bounds 有交集，否则 NSPopover 静默不显示。**
-        // 实测：按钮窗口被挪到所有屏幕之外（全屏 Space，见 AppDelegate 里那两种
-        // 锚点失效）时 dy 会是 -189，矩形整个飞出按钮，面板压根不出现——
-        // 比原来那 11pt 的位移糟糕得多。
-        //
-        // 正常修正量只有几个 pt（状态项窗口高度和菜单栏高度之差），
-        // 一旦大到脱离按钮，说明调用方的几何前提已经不成立了，退回按钮本身。
-        guard rect.intersects(button.bounds) else {
-            Log.write("[panel] 锚点几何异常（dy=\(Int(dy))），落点退回按钮矩形")
-            return button.bounds
-        }
-        return rect
+    /// 把锚点窗口摆到「`centerX` 正下方、贴着菜单栏下沿」，返回可交给
+    /// `NSPopover` 的视图。
+    ///
+    /// ## 为什么面板必须锚在这个窗口上，而不是状态项按钮上
+    ///
+    /// 全屏 Space 里菜单栏会自己收起来——指针一离开屏幕顶端，系统就把整条菜单栏
+    /// （连同状态项窗口）挪到屏幕外（实测停在 y=1112，两块屏最高才 1080）。
+    /// 而 `NSPopover` 是**跟着定位视图的窗口走**的：锚点一飞出屏幕，
+    /// 它就被约束回主屏原点——用户看到的是「鼠标刚移到面板上，面板就闪到左上角」。
+    ///
+    /// 锚点归自己管就没这回事：这个窗口摆好之后谁都不会动它，
+    /// 系统怎么折腾状态项都与面板无关。顺带也不必再盯着状态项窗口的高度变化重钉。
+    ///
+    /// 纵向仍然走 `menuBarBottom`（屏幕几何），所以状态项窗口是 33 还是退化成 22
+    /// 都不影响落点；横向由调用方给：图标可用时给图标中心，不可用时给指针。
+    @discardableResult
+    static func place(_ window: NSWindow, centerX: CGFloat, on screen: NSScreen,
+                      statusBarWindowHeight: CGFloat? = nil) -> NSView? {
+        let size = NSSize(width: 2, height: 2)
+        let x = min(max(centerX - size.width / 2, screen.frame.minX),
+                    screen.frame.maxX - size.width)
+        // 全屏 Space 里 visibleFrame == frame，直接拿 visibleFrame.maxY 会把整个
+        // 2pt 锚点放到屏幕外，NSPopover 随后照样把面板约束回主屏。
+        let y = max(screen.frame.minY,
+                    min(menuBarBottom(on: screen, statusBarWindowHeight: statusBarWindowHeight),
+                        screen.frame.maxY - size.height))
+        window.setFrame(NSRect(origin: NSPoint(x: x, y: y), size: size), display: false)
+        window.orderFrontRegardless()
+        return window.contentView
     }
 }

@@ -41,8 +41,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
     /// 面板的宿主，show 之前要叫它同步一次尺寸，见 `PanelHostingController`
     private var panelHost: (any PanelSizeSyncing)?
     private var statusImages: [Bool: NSImage] = [:]
-    /// 面板显示期间对状态项窗口几何的订阅，见 `observeAnchorGeometry`
-    private var anchorObservers: [NSObjectProtocol] = []
 
     override init() {
         // 必须在 Engine() 之前——引擎构造时就会做崩溃恢复并输出日志，
@@ -149,39 +147,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
             return
         }
 
-        // 全屏时按钮的锚点会失效，且有**两种**失效方式，都实测过：
-        //   ① 挪到所有屏幕之外——button.window?.screen == nil，锚点矩形 y=1114.5
-        //      而两块屏最高才 1080。面板被甩到主屏左上角还被屏幕边缘裁掉。
-        //   ② 停在**另一块屏**上——外接屏全屏时按钮窗口留在内建屏，
-        //      锚点「在某块屏幕上」这个检查照样通过，面板就开到左边那块屏去了。
-        // 所以判据不是「锚点在不在屏幕上」，而是「**在不在用户刚点的那块屏上**」。
+        let barHeight = button.window?.frame.height
+        guard let target = anchorTarget(for: button) else { return }
+
         // 面板能用多高，必须在 show 之前算好推给视图——视图那时还没有 window，
         // 自己判断不出会被摆到哪块屏。见 PanelMetrics 的注释。
-        let barHeight = button.window?.frame.height
-        if buttonAnchorIsUsable(button), let screen = button.window?.screen {
-            metrics.update(screen: screen,
-                           menuBar: PanelAnchor.menuBarHeight(on: screen,
-                                                              statusBarWindowHeight: barHeight))
-            // 必须在 show 之前——定位就发生在 show 那一刻，晚一帧面板就偏了
-            panelHost?.syncContentSize()
-            // 定位矩形不是 button.bounds：纵向要钉在菜单栏下沿，
-            // 不能跟着状态项窗口的高度跑。理由见 PanelAnchor。
-            popover.show(relativeTo: PanelAnchor.positioningRect(for: button, on: screen),
-                         of: button, preferredEdge: .minY)
-            observeAnchorGeometry(of: button)
-        } else {
-            // 走鼠标兜底时面板会开在指针所在屏，高度也要按那块屏算
-            let screen = clickedScreen() ?? NSScreen.main
-            metrics.update(screen: screen,
-                           menuBar: screen.map {
-                               PanelAnchor.menuBarHeight(on: $0, statusBarWindowHeight: barHeight)
-                           } ?? NSStatusBar.system.thickness)
-            panelHost?.syncContentSize()
-            showPanelNearMouse(statusBarHeight: barHeight)
-        }
+        metrics.update(screen: target.screen,
+                       menuBar: PanelAnchor.menuBarHeight(on: target.screen,
+                                                          statusBarWindowHeight: barHeight))
+        // 也必须在 show 之前——定位就发生在 show 那一刻，晚一帧面板就偏了
+        panelHost?.syncContentSize()
+
+        // **锚在自己的窗口上，不锚在状态项按钮上。** 全屏时菜单栏会自己收起来，
+        // 系统把状态项窗口挪到屏幕外，而 NSPopover 跟着定位视图走——面板会闪到
+        // 主屏左上角。锚点归自己管就没这回事。理由见 PanelAnchor.place。
+        guard let anchorView = PanelAnchor.place(anchorWindow, centerX: target.centerX,
+                                                 on: target.screen,
+                                                 statusBarWindowHeight: barHeight) else { return }
+        popover.show(relativeTo: anchorView.bounds, of: anchorView, preferredEdge: .minY)
+
         // 面板里全是滑块，打开就要能直接拖，所以得让本进程拿到焦点
         NSApp.activate()
         clearInitialFocus()
+    }
+
+    /// 面板开在哪：**图标正下方**；图标不可用时退回指针位置。
+    ///
+    /// 图标有**两种**失效方式，都实测过：
+    ///   ① 挪到所有屏幕之外——`button.window?.screen == nil`，锚点矩形 y=1114.5
+    ///      而两块屏最高才 1080（全屏 Space 里菜单栏收起来就是这样）。
+    ///   ② 停在**另一块屏**上——外接屏全屏时按钮窗口留在内建屏，
+    ///      「锚点在某块屏幕上」这个检查照样通过，面板就开到左边那块屏去了。
+    /// 所以判据不是「在不在屏幕上」，而是「**在不在用户刚点的那块屏上**」。
+    private func anchorTarget(for button: NSStatusBarButton) -> (screen: NSScreen, centerX: CGFloat)? {
+        if buttonAnchorIsUsable(button), let window = button.window, let screen = window.screen {
+            let rect = window.convertToScreen(button.convert(button.bounds, to: nil))
+            return (screen, rect.midX)
+        }
+        guard let screen = clickedScreen() ?? NSScreen.main else { return nil }
+        return (screen, NSEvent.mouseLocation.x)
     }
 
     /// 打开面板时**不要**让亮度输入框自动获得焦点。
@@ -201,34 +205,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
         }
     }
 
-    /// 面板开着的时候，状态项窗口的几何仍然可能被系统改（切 `activationPolicy`
-    /// 时菜单栏会重排）。`positioningRect` 是按 show 那一刻的几何算出来的，
-    /// 窗口一变它就过期了，面板会跟着挪。所以盯住这个窗口，变了就重钉一次。
-    ///
-    /// 只在面板显示期间订阅；`popoverDidClose` 里撤掉。
-    private func observeAnchorGeometry(of button: NSStatusBarButton) {
-        stopObservingAnchor()
-        guard let window = button.window else { return }
-        for name in [NSWindow.didResizeNotification, NSWindow.didMoveNotification] {
-            let token = NotificationCenter.default.addObserver(
-                forName: name, object: window, queue: .main
-            ) { [weak self] _ in
-                MainActor.assumeIsolated {
-                    guard let self, self.popover.isShown,
-                          let screen = button.window?.screen else { return }
-                    self.popover.positioningRect =
-                        PanelAnchor.positioningRect(for: button, on: screen)
-                }
-            }
-            anchorObservers.append(token)
-        }
-    }
-
-    private func stopObservingAnchor() {
-        anchorObservers.forEach(NotificationCenter.default.removeObserver)
-        anchorObservers.removeAll()
-    }
-
     /// 按钮锚点能不能用：必须落在**用户刚点击的那块屏**上。
     /// 只验「在不在某块屏幕上」不够——外接屏全屏时按钮停在内建屏，那个检查会放行。
     private func buttonAnchorIsUsable(_ button: NSStatusBarButton) -> Bool {
@@ -246,47 +222,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
         return NSScreen.screens.first { $0.frame.contains(mouse) }
     }
 
-    /// 锚点失效时的退路：改用指针位置。用一个透明小窗口当锚，
-    /// 因为 `show(relativeTo:of:)` 只认视图，不收裸矩形。
-    private func showPanelNearMouse(statusBarHeight: CGFloat?) {
-        let mouse = NSEvent.mouseLocation
-        guard let screen = clickedScreen() ?? NSScreen.main else { return }
-
-        let window = anchorWindow
-        // 贴着菜单栏下沿，水平对齐指针。全屏 Space 里 visibleFrame == frame，
-        // 直接用 visibleFrame.maxY 会把整个 2pt 锚点放到屏幕外，NSPopover
-        // 随后会被约束回主屏——所以菜单栏高度统一走 PanelAnchor（它记着这块屏
-        // 在普通 Space 里量到的值，全屏时拿出来用）。
-        let menuBarBottom = PanelAnchor.menuBarBottom(on: screen,
-                                                      statusBarWindowHeight: statusBarHeight)
-        let anchorSize = NSSize(width: 2, height: 2)
-        let anchorX = min(max(mouse.x - anchorSize.width / 2, screen.frame.minX),
-                          screen.frame.maxX - anchorSize.width)
-        let anchorY = max(screen.frame.minY,
-                          min(menuBarBottom, screen.frame.maxY - anchorSize.height))
-        window.setFrame(NSRect(origin: NSPoint(x: anchorX, y: anchorY), size: anchorSize),
-                        display: false)
-        window.orderFrontRegardless()
-        guard let anchor = window.contentView else { return }
-        popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
-    }
-
-    private lazy var anchorWindow: NSWindow = {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 2, height: 2),
-                         styleMask: .borderless, backing: .buffered, defer: false)
-        w.isOpaque = false
-        w.backgroundColor = .clear
-        w.hasShadow = false
-        w.level = .statusBar          // 和菜单栏同层，全屏空间里也在
-        w.ignoresMouseEvents = true
-        w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        w.contentView = NSView()
-        return w
-    }()
+    /// 面板的锚点。摆好之后**没有任何人会再动它**——这正是它存在的意义，
+    /// 见 `PanelAnchor.place`。
+    private lazy var anchorWindow: NSWindow = PanelAnchor.makeAnchorWindow()
 
     func popoverDidClose(_ notification: Notification) {
         anchorWindow.orderOut(nil)
-        stopObservingAnchor()
     }
 
     /// 打开设置窗口。面板是 `.transient` 的，窗口一拿到焦点它就自己关了——
