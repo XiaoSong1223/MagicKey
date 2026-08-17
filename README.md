@@ -15,17 +15,50 @@ MagicKey 是一款轻量的 macOS 菜单栏工具，为 MacBook 内置键盘背�
 
 ## 安装
 
+> [!IMPORTANT]
+> **发行包未经 Apple 公证，首次打开一定会被 Gatekeeper 拦下**——这不是包坏了，
+> 需要手动放行一次。原因与三种放行方式见下方[「首次打开被拦下」](#首次打开被拦下)。
+> 另外发行包是 arm64 单架构，**Intel 机型无法启动**。
+
 ### 下载发行包
 
-从 [Releases](https://github.com/XiaoSong1223/MagicKey/releases/latest) 下载 `MagicKey-<版本>.zip`，解压后把 `MagicKey.app` 拖进 `/Applications`。
+从 [Releases](https://github.com/XiaoSong1223/MagicKey/releases/latest) 下载 `MagicKey-<版本>.zip`，解压后把 `MagicKey.app` 拖进 `/Applications`，然后按下一节放行一次。
 
-发行包只做了本地 ad-hoc 签名，未经 Developer ID 公证，首次打开会被 Gatekeeper 拦下。解除隔离属性后即可正常启动：
+### 首次打开被拦下
+
+MagicKey 只做了本地 ad-hoc 签名，没有 Developer ID，也没有经过公证，因此 Gatekeeper 一律拒绝：
+
+```console
+$ codesign -dv MagicKey.app
+Signature=adhoc          TeamIdentifier=not set
+
+$ spctl -a -t exec -vvv MagicKey.app
+MagicKey.app: rejected
+```
+
+从浏览器下载的压缩包还会被系统打上隔离属性（`com.apple.quarantine`），双击时提示“Apple 无法验证此 App 是否包含恶意软件”。三种放行方式，任选其一，都是**一次性**的：
+
+**① 系统设置放行（不用终端）**
+
+先双击一次 `MagicKey.app`，让系统记下这次拦截，然后打开**系统设置 → 隐私与安全性**，向下滚动到安全性一栏，点击“仍要打开”，再确认一次即可。
+
+> [!NOTE]
+> macOS 15 起，Apple 移除了“右键 → 打开”这条旧捷径。现在只剩系统设置这一条路径。
+
+**② 命令行解除隔离属性**
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/MagicKey.app
 ```
 
-也可以在“系统设置 → 隐私与安全性”中找到被拦截的提示并选择“仍要打开”。
+**③ 从源码构建**
+
+本地构建出来的应用不带隔离属性，完全不会遇到这道拦截。见下一节。
+
+> [!NOTE]
+> **“开机自动启动”依赖代码签名。** `SMAppService` 要求应用带有系统认可的签名，
+> 而发行包只有本地 ad-hoc 签名，注册有可能被系统拒绝；被拒时界面会如实显示错误，
+> 其余功能不受影响。发行包与 `make install` 的签名方式完全相同，两者行为一致。
 
 ### 从源码构建
 
@@ -55,7 +88,8 @@ make -C app uninstall
 卸载前请先在 MagicKey 中关闭“开机自动启动”。卸载命令只移除 `/Applications/MagicKey.app`，不会删除已有偏好设置。
 
 > [!NOTE]
-> 当前尚未提供 Homebrew cask，发行包也未进行 Developer ID 公证。正式分发流程仍在完善中。
+> 当前尚未提供 Homebrew cask。Developer ID 签名与公证也还没有做，那会一并去掉
+> 上面那道拦截，并让发行包中的“开机自动启动”可用。
 
 ## 功能
 
