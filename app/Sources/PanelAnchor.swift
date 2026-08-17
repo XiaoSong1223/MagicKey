@@ -57,27 +57,63 @@ enum PanelAnchor {
                                           statusBarWindowHeight: statusBarWindowHeight)
     }
 
-    /// 交给 `NSPopover` 的定位矩形，在 `button` 自己的坐标系里。
-    /// 横向原样保留（就是图标本身），纵向拉到菜单栏下沿。
-    ///
-    /// 面板开着的时候如果锚点窗口的几何变了，这个矩形就过期了——
-    /// 调用方要盯着窗口的 move/resize 重算一次，见 `AppDelegate.observeAnchorGeometry`。
     /// 造一个当锚点用的透明小窗口。
     ///
     /// `NSPopover.show(relativeTo:of:)` 只认视图、不收裸矩形，所以必须有个真窗口。
     /// `.statusBar` 层 + `canJoinAllSpaces` / `fullScreenAuxiliary`，
     /// 否则它进不了全屏空间，面板也就跟着开不出来。
+    ///
+    /// 它还兼着第二个职责：**把应用拉活**。见 `AnchorPanel`。
     static func makeAnchorWindow() -> NSWindow {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 2, height: 2),
-                         styleMask: .borderless, backing: .buffered, defer: false)
+        let w = AnchorPanel(contentRect: NSRect(x: 0, y: 0, width: 2, height: 2),
+                            styleMask: [.nonactivatingPanel, .borderless],
+                            backing: .buffered, defer: false)
         w.isOpaque = false
         w.backgroundColor = .clear
         w.hasShadow = false
         w.level = .statusBar
         w.ignoresMouseEvents = true
+        w.hidesOnDeactivate = false
         w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         w.contentView = NSView()
         return w
+    }
+
+    /// 锚点窗口。除了「给 `NSPopover` 一个不会被系统挪动的定位视图」之外，
+    /// 它还是本应用**唯一**能让面板拿到焦点的手段。
+    ///
+    /// ## 为什么焦点只能从这里来
+    ///
+    /// `.accessory` 应用在自己不活跃时**无法自我激活**，实测三个 API 全被忽略
+    /// （`NSApp.deactivate()` 之后逐个试，`isActive` 一直是 false）：
+    ///
+    /// | 调用 | 结果 |
+    /// |---|---|
+    /// | `NSApp.activate()` | 无效 |
+    /// | `NSApp.activate(ignoringOtherApps: true)`（已废弃） | 无效 |
+    /// | `NSRunningApplication.current.activate(options:)` | 无效 |
+    ///
+    /// 而 `NSPopover` 自己的窗口（`_NSPopoverWindow`）虽然 `canBecomeKey == true`，
+    /// 在应用不活跃时 `makeKey()` 是**空操作**：`NSApp.keyWindow` 仍然是 nil。
+    /// 往它的 `styleMask` 里塞 `.nonactivatingPanel` 也没用——那个 setter 被 AppKit 吃掉。
+    ///
+    /// 唯一还生效的是：对一个 **`.nonactivatingPanel` 窗口** `makeKey()`。
+    /// 它会连带把应用一起拉活（实测 `isActive` false → true）。锚点是我们自己的窗口，
+    /// 就让它来干这件事：锚点成为 key 之后，面板作为它的子窗口 `isKeyWindow` 也变成
+    /// true，控件立刻按活跃样式绘制。
+    ///
+    /// 不这么做的后果不是「少一点焦点」，是三个连着的 bug：
+    /// ① 控件全部画成非活跃样式，看着像禁用；
+    /// ② 应用从不活跃，`.transient` 面板**点别处关不掉**（本进程根本收不到那些事件）；
+    /// ③ 键盘输入没有去处（`NSApp.keyWindow == nil`），亮度输入框打不了字。
+    ///
+    /// `borderless` 窗口的 `canBecomeKey` 默认是 false，所以必须覆写——
+    /// 只给 `.nonactivatingPanel` 而不覆写，实测 `canBecomeKey` 仍然是 false，
+    /// `makeKey()` 照样无效。
+    fileprivate final class AnchorPanel: NSPanel {
+        override var canBecomeKey: Bool { true }
+        /// 主窗口是「文档窗口」的概念，2pt 的锚点不该去当它
+        override var canBecomeMain: Bool { false }
     }
 
     /// 把锚点窗口摆到「`centerX` 正下方、贴着菜单栏下沿」，返回可交给

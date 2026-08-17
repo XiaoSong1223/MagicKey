@@ -164,11 +164,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
         guard let anchorView = PanelAnchor.place(anchorWindow, centerX: target.centerX,
                                                  on: target.screen,
                                                  statusBarWindowHeight: barHeight) else { return }
+
+        // **先让锚点成为 key，再 show。** 面板里全是滑块和输入框，打开就要能直接操作，
+        // 而 `.accessory` 应用不活跃时唯一能把自己拉活的手段就是对锚点这个
+        // `.nonactivatingPanel` 窗口 `makeKey()`——`NSApp.activate()` 那一族全被系统
+        // 忽略。理由和实测见 `PanelAnchor.AnchorPanel`。
+        //
+        // 顺序不能反：show 之后再 makeKey 最终状态一样，但中间会有几帧面板是灰的。
+        anchorWindow.makeKey()
         popover.show(relativeTo: anchorView.bounds, of: anchorView, preferredEdge: .minY)
 
-        // 面板里全是滑块，打开就要能直接拖，所以得让本进程拿到焦点
-        NSApp.activate()
         clearInitialFocus()
+        logFocus()
+    }
+
+    /// 面板拿没拿到焦点。控件发灰、点别处关不掉、输入框打不了字——
+    /// 这三个症状都是同一件事，出问题时先看这行，别去调颜色或改 popover.behavior。
+    private func logFocus() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            let win = self?.popover.contentViewController?.view.window
+            Log.write("[panel] isActive=\(NSApp.isActive) "
+                      + "isKey=\(win?.isKeyWindow ?? false) "
+                      + "keyWindow=\(NSApp.keyWindow.map { "\(type(of: $0))" } ?? "nil")")
+        }
     }
 
     /// 面板开在哪：**图标正下方**；图标不可用时退回指针位置。
@@ -196,12 +214,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
     /// 而用户九成是来拖滑块或换效果的。
     ///
     /// 清掉之后输入框仍然点得进去，Tab 也照样能走到它。
+    ///
+    /// **两个窗口都要清。** 焦点是靠锚点 `makeKey()` 拿到的，`NSApp.keyWindow`
+    /// 落在锚点上而不是面板窗口上（面板是它的子窗口，只是跟着画成活跃）。
+    /// 只清面板那个，字段编辑器仍然可能挂在锚点的响应链上。
     private func clearInitialFocus() {
         // show() 之后窗口才存在，推迟一个 runloop
         DispatchQueue.main.async { [weak self] in
-            guard let win = self?.popover.contentViewController?.view.window else { return }
-            win.initialFirstResponder = nil
-            win.makeFirstResponder(nil)
+            guard let self else { return }
+            for win in [self.popover.contentViewController?.view.window, self.anchorWindow] {
+                guard let win else { continue }
+                win.initialFirstResponder = nil
+                win.makeFirstResponder(nil)
+            }
         }
     }
 
@@ -228,6 +253,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
 
     func popoverDidClose(_ notification: Notification) {
         anchorWindow.orderOut(nil)
+
+        // **面板关掉就把前台还回去。** 打开面板会把本应用拉活（锚点 makeKey，
+        // 见 `PanelAnchor.AnchorPanel`），不还的话：用户上一个 app 的标题栏一直是灰的，
+        // 而本应用作为 `.accessory` 又没有任何窗口收键盘——敲字掉进黑洞。
+        //
+        // 设置窗口开着时**不能还**：那正好会把它变成非 key，控件全画灰，
+        // 也就是 `SettingsWindowController.bringToFront` 花了力气避开的那件事。
+        DispatchQueue.main.async {
+            guard !SettingsWindowController.isOpen else { return }
+            NSApp.deactivate()
+        }
     }
 
     /// 打开设置窗口。面板是 `.transient` 的，窗口一拿到焦点它就自己关了——

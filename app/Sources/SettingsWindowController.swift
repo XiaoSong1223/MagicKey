@@ -12,6 +12,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private static var shared: SettingsWindowController?
 
+    /// 设置窗口开着没有。面板关闭时要据此决定还不还前台——
+    /// 见 `AppDelegate.popoverDidClose`。
+    static var isOpen: Bool { shared != nil }
+
     /// 打开设置窗口；已经开着就拿到最前面。
     static func show(settings: Settings, updates: UpdateChecker) {
         if let existing = shared {

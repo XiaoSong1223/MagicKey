@@ -36,7 +36,7 @@ macOS 菜单栏应用，给 MacBook 内置键盘背光加动态效果（呼吸/�
 ```bash
 cd app   && make install     # 构建 + 装到 /Applications + 启动
 cd app   && make run         # 直接跑 bundle 内可执行文件，日志打终端（调试用）
-cd app   && make probe-ui    # UI 回归：面板高度/收缩/窄屏/五态/更新五态
+cd app   && make probe-ui    # UI 回归：面板高度/收缩/窄屏/五态/更新五态/落点/焦点
 cd tools && make analyze     # 分析效果曲线
 cd tools && make preview     # 真实键盘预览，Ctrl-C 还原
 ```
@@ -86,7 +86,8 @@ xcrun --sdk macosx --show-sdk-version   # → 26.5
 | `Engine.Phase` 结构化状态（绿/灰/橙/红） | ✅ `status` 字符串原样保留 |
 | 音乐律动七态 `AudioStatus` | ✅ 含「没声音在放」与推断的「未授权」+ 跳转 |
 | `mainMenu` / ⌘Q | ✅ 之前 ⌘Q 完全无效（从未设过 mainMenu） |
-| UI 探针 `make probe-ui` | ✅ 高度/收缩/窄屏/五态/更新五态/面板落点/设置窗口居中 |
+| 面板打开即可操作（焦点） | ✅ 锚点改 `.nonactivatingPanel` 拉活应用，探针带阴性对照 |
+| UI 探针 `make probe-ui` | ✅ 高度/收缩/窄屏/五态/更新五态/面板落点/面板焦点/设置窗口居中 |
 | 状态还原 **六个时机** | ✅ 全部实测：正常退出、手动停止、崩溃重启、系统睡眠、SIGTERM、锁屏 |
 
 ### 性能实测（30 分钟长测，10.8 万帧）
@@ -161,7 +162,10 @@ xcrun --sdk macosx --show-sdk-version   # → 26.5
 
 - [ ] 规则引擎：当前 App / 时间段 / 电量 / 是否插电 / 专注模式 → 切换效果
 
-### v1.0
+### v1.0 之后
+
+> **发行版本号 2026-08-17 起跳到 1.0**（v0.7 之后直接发 v1.0，旧的 v0.4–v0.7
+> release 已删除，tag 保留）。本节这些标题是**功能桶**，不是发行号，别把两者对齐。
 
 - [ ] 效果脚本化（JavaScriptCore 或简单 DSL），社区分享
 - [ ] 多键盘支持（外接妙控键盘也有 backlight ID）
@@ -354,6 +358,32 @@ built-in 菜单栏上控制中心从 900pt 起往右排，于是留给第三方�
 解法不是把动画调慢或调快，是**让布局和窗口同一帧到位，只 animate 不参与布局的属性**：
 自己搭展开控件，新内容用 `.transition(.opacity)` 淡入，箭头用 `rotationEffect`。
 判据很硬：改完再采样，t=0 就是终值且此后不变。
+
+**`.accessory` 应用无法自我激活，所以面板的焦点只能从锚点窗口来。**
+用户报的是「点开面板要再点一次才能操作」，实际是三个连着的症状：控件全画成灰的
+（像禁用）、`.transient` 面板**点别处关不掉**、亮度框打不了字。根子是同一个：
+`NSApp.keyWindow == nil`。实测（`NSApp.deactivate()` 之后逐个试）：
+
+| 调用 | 结果 |
+|---|---|
+| `NSApp.activate()` | 无效 |
+| `NSApp.activate(ignoringOtherApps: true)`（已废弃） | 无效 |
+| `NSRunningApplication.current.activate(options:)` | 无效 |
+| `_NSPopoverWindow.makeKey()` | 无效（`canBecomeKey` 是 true，照样不给） |
+| 往 `_NSPopoverWindow.styleMask` 塞 `.nonactivatingPanel` | setter 被 AppKit 吃掉 |
+
+唯一还生效的是**对一个 `.nonactivatingPanel` 窗口 `makeKey()`**，它会连带把应用拉活。
+锚点正好是我们自己的窗口，就让它干：`NSPanel([.nonactivatingPanel, .borderless])`
+且**必须覆写 `canBecomeKey`**（borderless 默认 false，只给 style mask 不覆写照样无效），
+在 `show` **之前** `makeKey()`（反过来最终态一样，但中间几帧面板是灰的）。
+面板关掉时要 `NSApp.deactivate()` 把前台还回去，否则用户上一个 app 一直灰着、
+敲字掉进黑洞——但**设置窗口开着时不能还**，那正好会把它变灰。
+
+**测这件事必须先把探针自己踢出前台。** 探针进程平时是活跃的，不 `deactivate()`
+就会全绿而毫无意义——这也是为什么早先量到 `isActive=true isKey=true`
+却和用户的症状对不上：从终端启动的进程继承了激活权，`NSApp.activate()` 当时真的成功了。
+真实场景（用户正在别的 app 里点图标）没有这个授权。`make probe-ui` 的
+「面板焦点」一组带阴性对照：换回普通 borderless 锚点必须报 `isKey=false`。
 
 **面板高度的三个坑，是同一个问题的三种表现：**
 

@@ -444,6 +444,85 @@ enum UIProbe {
         return failures
     }
 
+    /// 面板打开就能操作：**应用被拉活，面板按活跃样式绘制。**
+    ///
+    /// 这一组测的是那个「点开面板要再点一次才能用」的 bug。它有三副面孔——
+    /// 控件发灰像禁用、点别处关不掉、亮度框打不了字——根子是同一个：
+    /// `.accessory` 应用不活跃时没有任何自我激活的手段，`NSApp.keyWindow` 是 nil。
+    ///
+    /// **它能自动化，全靠 `NSApp.deactivate()`。** 把探针自己踢出前台之后，
+    /// `NSApp.activate()` / `activate(ignoringOtherApps:)` /
+    /// `NSRunningApplication.activate` 三个全部失效（实测），也就精确复现了
+    /// 「用户正在别的 app 里，伸手点一下状态栏图标」那一刻的处境。
+    /// 探针进程平时是活跃的，不先踢出去的话这一组会**全绿而毫无意义**。
+    ///
+    /// 阴性对照就在函数里：同样的步骤换回改之前的普通 borderless 锚点，
+    /// 面板必须**拿不到** key。拿不到，才证明这个检查测得到东西。
+    static func focusChecks() -> [String] {
+        var failures: [String] = []
+        print("\n── 面板焦点 ──")
+        guard let screen = NSScreen.screens.first(where: { $0.frame.maxY > $0.visibleFrame.maxY })
+                ?? NSScreen.main else { return ["拿不到屏幕"] }
+
+        /// 改之前的锚点：普通 borderless 窗口，`canBecomeKey == false`
+        func plainAnchor() -> NSWindow {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 2, height: 2),
+                             styleMask: .borderless, backing: .buffered, defer: false)
+            w.isOpaque = false
+            w.backgroundColor = .clear
+            w.hasShadow = false
+            w.level = .statusBar
+            w.ignoresMouseEvents = true
+            w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            w.contentView = NSView()
+            return w
+        }
+
+        /// 走 app 的真实顺序：place → 锚点 makeKey → show
+        func trial(_ tag: String, _ anchor: NSWindow) -> (active: Bool, key: Bool)? {
+            NSApp.deactivate()
+            settle(0.9)
+            guard !NSApp.isActive else {
+                failures.append("探针退不出前台，焦点检查没跑成（\(tag)）")
+                print("  \(tag)：⚠️ 探针仍在前台，这一步测不了")
+                return nil
+            }
+            let po = NSPopover()
+            po.behavior = .applicationDefined
+            let vc = NSViewController()
+            vc.view = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 120))
+            po.contentViewController = vc
+            defer { po.performClose(nil); anchor.orderOut(nil); settle(0.3) }
+
+            guard let anchorView = PanelAnchor.place(anchor, centerX: screen.frame.midX,
+                                                     on: screen) else {
+                failures.append("锚点窗口没建起来（\(tag)）")
+                return nil
+            }
+            anchor.makeKey()
+            po.show(relativeTo: anchorView.bounds, of: anchorView, preferredEdge: .minY)
+            settle(0.5)
+            let active = NSApp.isActive
+            let key = po.contentViewController?.view.window?.isKeyWindow ?? false
+            print("  \(tag)：canBecomeKey=\(anchor.canBecomeKey) → "
+                  + "isActive=\(active) 面板 isKey=\(key)")
+            return (active, key)
+        }
+
+        // 现状：锚点是 .nonactivatingPanel，makeKey 连带把应用拉活
+        if let now = trial("① 现在的锚点", PanelAnchor.makeAnchorWindow()) {
+            if !now.active { failures.append("点开面板没能把应用拉活（控件会画成灰的）") }
+            if !now.key { failures.append("面板窗口不是 key（控件会画成灰的、点别处关不掉）") }
+        }
+        // 阴性对照：换回普通窗口，必须失败
+        if let before = trial("② 阴性对照（改之前的普通锚点）", plainAnchor()) {
+            if before.key {
+                failures.append("阴性对照没复现：普通锚点也拿到了 key，说明这个检查测不出东西")
+            }
+        }
+        return failures
+    }
+
     /// 设置窗口每次打开都在屏幕正中
     static func settingsCenterChecks(settings: Settings, updates: UpdateChecker) -> [String] {
         print("\n── 设置窗口位置 ──")
@@ -624,6 +703,7 @@ enum UIProbe {
         // 放在最后：settingsCenterChecks 会把 activationPolicy 切成 .regular，
         // 别让它影响前面那些尺寸测量。
         failures += anchorChecks()
+        failures += focusChecks()
         failures += settingsCenterChecks(settings: settings, updates: updates)
 
         // ── 汇总 ───────────────────────────────────────────────────
