@@ -142,8 +142,9 @@ xcrun --sdk macosx --show-sdk-version   # → 26.5
       ③ 会推翻「零权限」这条产品线。
       真要做时：`CGEventTap` 监听 `.keyDown` 取 keycode，做成默认关闭的可选项，
       未授权时静默降级回纯 `KeyRepeatFilter` 行为。
-      （2026-08-23 注：键盘音效已把「输入监控」做成可选项且用的是 `NSEvent` 监听而非
-      `CGEventTap`——真要做黑名单时优先挂在 `KeySoundController` 的事件流上，
+      （2026-08-24 注：键盘音效已把「输入监控」做成可选项，用的就是 listen-only
+      `CGEventTap`（原先写 `NSEvent` 监听，那条路要的是**辅助功能**，见「踩过的坑」）——
+      真要做黑名单时直接挂在 `KeySoundController.tapReceived` 上，
       对已为音效授权的用户权限成本为零。）
 - [ ] 按键脉冲叠加在呼吸底色上（`EffectStack` 的瞬时层就是为这个建的，至今没人调用 `push()`）
 - [ ] **CLI + URL Scheme** ← 这是最被低估的功能，见下方说明
@@ -650,6 +651,43 @@ x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_A
 「输入监控」的 `Privacy_ListenEvent` 就不在其中。完整的表在同 bundle 的
 `Contents/Resources/TCCServiceList.plist`——`kTCCService…` 条目的
 `revealElementKeyName` 字段才是锚点名。先查 plist，再拿 strings 兜底。
+
+**监听全局按键有两条路，要的是两种不同的权限——选错了会「只有 Shift 有声」。**
+（2026-08-24 真机，本项目实测踩到）
+
+| 方式 | 需要的 TCC 服务 | 系统设置里的名字 |
+|---|---|---|
+| `NSEvent.addGlobalMonitorForEvents(.keyDown/.keyUp)` | `kTCCServiceAccessibility` | **辅助功能** |
+| `CGEvent.tapCreate`（listen-only） | `kTCCServiceListenEvent` | **输入监控** |
+
+Apple 文档在 `addGlobalMonitorForEvents` 上写着 *"Key-related events may only be
+monitored if accessibility is enabled"*，本项目当初却写成「两者都要输入监控」，
+于是整套授权流程申请 `ListenEvent`、实际用 `NSEvent`，**永远对不上**。
+
+**症状极难认**：`flagsChanged`（修饰键）不受辅助功能约束，照样送达——所以
+**Shift 和大小写切换有声，其他键全哑**。而进程内自查**全是绿的**：
+`IOHIDCheckAccess = granted`、monitor 装上了、
+`事件到达 → scheduleBuffer` 的延迟统计也在正常打点（打的是修饰键那几下）。
+唯一的证据在 tccd 日志里：
+
+```bash
+log show --last 20m --style compact --predicate 'process == "tccd"' | grep -i magickey
+# → Failed to match existing code requirement for subject … and service kTCCServiceAccessibility
+```
+
+现在用的是 listen-only `CGEventTap`，要的正是「输入监控」，和 UI、
+`IOHIDRequestAccess`、`resetOwnRecord` 申请的是同一个服务。
+**不去要辅助功能**——那个权限的语义是「可以控制这台电脑」，为一个键盘音效要它太重。
+
+两条附带的教训：
+
+- **`CGEvent.tapCreate` 返回 nil 是「此刻真的收不到按键」唯一诚实的判据。**
+  `IOHIDCheckAccess` 说的是「记录里写着允许」，两者在「授权后没重启进程」时不一致。
+  `apply()` 现在按 tap 建不建得起来决定要不要报「响应中」，建不起来就是 `.blocked`。
+- **`tapDisabledByTimeout` / `tapDisabledByUserInput` 必须在回调里重新启用。**
+  不处理的话此后一个事件都收不到，而且不报错——和「授权没生效」长得一模一样。
+  session 级 tap 连本应用自己窗口的按键一起收，所以**不要**再补 local monitor，
+  补了同一下会响两声。
 
 **「输入监控」有三个和别的 TCC 权限都不一样的脾气**（2026-08-23，键盘音效实测）：
 ① **授权对已运行进程不生效**，必须退出重开——勾完之后 `IOHIDCheckAccess` 立刻返回

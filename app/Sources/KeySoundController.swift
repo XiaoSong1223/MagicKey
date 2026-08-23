@@ -54,8 +54,8 @@ final class KeySoundController: ObservableObject {
     /// 都会触发一次收敛，没有缓存的话每点一下都要把全部采样重解码。
     private var loadedCustom: LoadedCustomSounds?
 
-    private var globalMonitor: Any?
-    private var localMonitor: Any?
+    private var eventTap: CFMachPort?
+    private var tapSource: CFRunLoopSource?
     private var activeObserver: NSObjectProtocol?
 
     /// 上一次看到的修饰键状态。`flagsChanged` 只告诉你「现在是哪些」，
@@ -335,7 +335,14 @@ final class KeySoundController: ObservableObject {
         // 但不该在开发者跑回归测试的时候真的出声。
         if Self.probeAccessOverride != nil { player.setVolume(0) }
         #endif
-        installMonitors()
+        // **装不上就别说「响应中」。** `accessGranted()` 说的是「记录里写着允许」，
+        // tap 建不建得起来说的是「这一刻真的能收到按键」——授权后没重启进程时
+        // 两者就是不一致的。少了这一步会亮着绿灯一声不出，而那是最坏的一态。
+        guard installMonitors() else {
+            teardown()
+            status = .blocked
+            return
+        }
         player.start()
         status = .running
     }
@@ -379,39 +386,102 @@ final class KeySoundController: ObservableObject {
 
     // MARK: - 事件监听
 
-    /// **两个 monitor 都要装。**
-    ///   - global：别的 app 在前台时的按键，也就是绝大多数情况
-    ///   - local：本应用自己的窗口（面板里的亮度输入框、设置窗口）收到的按键。
-    ///     global monitor **收不到自己进程的事件**，只装它的话「点开面板打字没声音」。
+    /// 装事件 tap。**成功与否是返回值，不是无条件成功**——见下面为什么。
     ///
-    /// 用 `NSEvent` 而不是 `CGEventTap`：两者都要「输入监控」授权，但 event tap
-    /// 是**同步插在事件流里**的，回调慢了会拖慢整个系统的按键响应，而且被系统
-    /// 判定超时后会被静默禁用（还得自己监听 `tapDisabled` 再启用）。
-    /// 这个功能只需要**旁观**，不需要修改或吞掉事件，没有理由付那份风险。
-    private func installMonitors() {
-        guard globalMonitor == nil, localMonitor == nil else { return }
-        let mask: NSEvent.EventTypeMask = [.keyDown, .keyUp, .flagsChanged]
+    /// ## 为什么是 `CGEventTap` 而不是 `NSEvent.addGlobalMonitorForEvents`
+    ///
+    /// 本文件曾写着「两者都要『输入监控』授权，而 event tap 同步插在事件流里、
+    /// 有被系统停用的风险，所以选 NSEvent」——**前半句是错的，代价是整个功能哑掉**。
+    ///
+    /// `NSEvent` 全局监听**按键事件**要的是**辅助功能**（`kTCCServiceAccessibility`），
+    /// 不是「输入监控」。Apple 文档写得很清楚：*"Key-related events may only be
+    /// monitored if accessibility is enabled"*。而 `flagsChanged` 不受这条约束。
+    /// 于是出现一个非常难认的症状：**Shift 和大小写切换有声，其他键全哑**——
+    /// 授权状态、监听安装、`scheduleBuffer` 延迟统计**全部正常**，
+    /// 因为修饰键那条路确实是通的（2026-08-24 真机，tccd 日志里是
+    /// `Failed to match existing code requirement ... kTCCServiceAccessibility`）。
+    ///
+    /// 改用 listen-only 的 `CGEventTap`：它要的正是「输入监控」，和整个 UI、
+    /// `IOHIDRequestAccess`、`resetOwnRecord` 申请的是同一个服务。
+    /// **不去要辅助功能**——那个权限的语义是「可以控制这台电脑」，
+    /// 为一个键盘音效去要它，比这个功能本身重得多。
+    ///
+    /// `.listenOnly` 意味着系统不等我们的回调，拖慢不了别人的按键；
+    /// 被系统停用时会投递 `tapDisabledBy*`，在回调里重新启用即可。
+    ///
+    /// **只要一个 tap。** session 级的 tap 连本应用自己窗口里的按键一起收，
+    /// 不需要再补一个 local monitor（补了就是同一下响两声）。
+    @discardableResult
+    private func installMonitors() -> Bool {
+        guard eventTap == nil else { return true }
 
         // 装的这一刻用户可能正按着 Shift。不种下当前值的话，第一次
         // flagsChanged（松开 Shift）会被算成「按下」，凭空多一声。
         lastFlags = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
 
-        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] event in
-            MainActor.assumeIsolated { self?.handle(event) }
+        let mask: CGEventMask =
+            (1 << CGEventType.keyDown.rawValue) |
+            (1 << CGEventType.keyUp.rawValue) |
+            (1 << CGEventType.flagsChanged.rawValue)
+
+        // C 函数指针，捕获不了 self，只能走 refcon。这里传 unretained：
+        // tap 的生命周期完全由本对象持有，反过来强引用就是循环。
+        let callback: CGEventTapCallBack = { _, type, event, refcon in
+            guard let refcon else { return Unmanaged.passUnretained(event) }
+            let me = Unmanaged<KeySoundController>.fromOpaque(refcon).takeUnretainedValue()
+            MainActor.assumeIsolated { me.tapReceived(type: type, event: event) }
+            return Unmanaged.passUnretained(event)
         }
-        localMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
-            MainActor.assumeIsolated { self?.handle(event) }
-            return event        // 只是旁观，必须原样放行
+
+        guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap,
+                                          place: .tailAppendEventTap,
+                                          options: .listenOnly,
+                                          eventsOfInterest: mask,
+                                          callback: callback,
+                                          userInfo: Unmanaged.passUnretained(self).toOpaque())
+        else {
+            // **这是本功能唯一一个诚实的「真的能不能收到按键」判据。**
+            // `IOHIDCheckAccess` 说的是「记录里写着允许」，tap 建得起来说的是
+            // 「这一刻真的允许」。两者会不一致（授权后未重启就是），
+            // 不看这个就会亮着绿灯说「响应中」而一声不出。
+            Log.write("[keysound] 事件 tap 创建失败——「输入监控」对本进程未生效")
+            return false
         }
-        Log.write("[keysound] 已安装按键监听（global=\(globalMonitor != nil) local=\(localMonitor != nil)）")
+
+        let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        eventTap = tap
+        tapSource = src
+        Log.write("[keysound] 已安装事件 tap（session / listenOnly）")
+        return true
     }
 
     private func removeMonitors() {
-        for m in [globalMonitor, localMonitor] where m != nil {
-            NSEvent.removeMonitor(m!)
+        if let tapSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), tapSource, .commonModes)
         }
-        globalMonitor = nil
-        localMonitor = nil
+        if let eventTap {
+            CGEvent.tapEnable(tap: eventTap, enable: false)
+            CFMachPortInvalidate(eventTap)
+        }
+        tapSource = nil
+        eventTap = nil
+    }
+
+    /// tap 的回调。跑在主 runloop 所在的线程上（source 就是加在那儿的）。
+    ///
+    /// **`tapDisabledBy*` 必须处理。** 系统会在回调超时或用户输入过快时
+    /// 把 tap 停掉并投递这两个类型，不重新启用的话此后一个事件都收不到，
+    /// 而且没有任何报错——和「授权没生效」长得一模一样。
+    private func tapReceived(type: CGEventType, event: CGEvent) {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let eventTap { CGEvent.tapEnable(tap: eventTap, enable: true) }
+            Log.write("[keysound] 事件 tap 被系统停用（type=\(type.rawValue)），已重新启用")
+            return
+        }
+        guard let ns = NSEvent(cgEvent: event) else { return }
+        handle(ns)
     }
 
     /// 时间戳要在**函数第一行**取。晚一点取都会把本函数自己的耗时算漏，
@@ -527,7 +597,7 @@ final class KeySoundController: ObservableObject {
     /// 两条分支，就必须能逐步重设它。
     static func setProbeLaunchAccess(_ v: Bool?) { launchAccess = v }
 
-    var probeIsListening: Bool { globalMonitor != nil || localMonitor != nil }
+    var probeIsListening: Bool { eventTap != nil }
     var probeEngineIsRunning: Bool { player.isRunning }
     /// 「总开关关掉 → 自定义层整个旁路」这条线是收敛逻辑，不是播放逻辑，
     /// 所以判据要落在 controller 上，不能只测 player
