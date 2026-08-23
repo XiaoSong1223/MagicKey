@@ -16,6 +16,14 @@ RESOURCES := Resources/AppIcon.icns \
              Resources/StatusKeyActive.png Resources/StatusKeyActive@2x.png \
              Resources/StatusKeyInactive.png Resources/StatusKeyInactive@2x.png
 
+# 键盘音效的采样。**整目录拷**，不像上面那样逐个列——一套包 12 个文件，
+# 三套就是 36 个，列出来的唯一作用是漏掉新加的那个然后在运行时静默变哑。
+# 目录结构（Sounds/<包名>/{press,release}/*.mp3）是 KeySoundPack 直接依赖的，
+# 拷的时候必须原样保留，所以是 cp -R 而不是 cp。
+# 展开成文件列表只为了当依赖：改一个 mp3 也要触发重新打包。
+SOUNDS_DIR   := Resources/Sounds
+SOUND_FILES  := $(shell find $(SOUNDS_DIR) -type f 2>/dev/null)
+
 SWIFTC  := swiftc
 TARGET  := arm64-apple-macos14.0
 
@@ -29,8 +37,11 @@ TARGET  := arm64-apple-macos14.0
 SDK_MAJOR  := $(shell xcrun --sdk macosx --show-sdk-version 2>/dev/null | cut -d. -f1)
 GLASS_FLAG := $(shell [ "$(SDK_MAJOR)" -ge 26 ] 2>/dev/null && echo -D LIQUID_GLASS_SDK)
 
+# AVFoundation：键盘音效的播放（AVAudioEngine + 预载 PCM buffer）
+# IOKit：      查「输入监控」授权（IOHIDCheckAccess / IOHIDRequestAccess）
 FLAGS   := -swift-version 5 -parse-as-library -target $(TARGET) $(GLASS_FLAG) \
-           -framework SwiftUI -framework AppKit -framework ServiceManagement
+           -framework SwiftUI -framework AppKit -framework ServiceManagement \
+           -framework AVFoundation -framework IOKit
 
 # UI 探针：复用 app 的**真实**视图和状态类型，只把入口换掉。
 # 排除 MagicKeyApp.swift（它带 @main），加上 Probe/UIProbe.swift。
@@ -48,21 +59,23 @@ PROBE_SOURCES := $(CORE) $(filter-out Sources/MagicKeyApp.swift,$(wildcard Sourc
 
 all: $(BUNDLE)
 
-$(BUNDLE): $(SOURCES) Resources/Info.plist $(RESOURCES)
+$(BUNDLE): $(SOURCES) Resources/Info.plist $(RESOURCES) $(SOUND_FILES)
 	@rm -rf $(BUNDLE)
 	@mkdir -p $(CONTENTS)/MacOS $(CONTENTS)/Resources
 	@cp Resources/Info.plist $(CONTENTS)/Info.plist
 	@cp $(RESOURCES) $(CONTENTS)/Resources/
+	@cp -R $(SOUNDS_DIR) $(CONTENTS)/Resources/
 	$(SWIFTC) -O $(FLAGS) $(SOURCES) -o $(CONTENTS)/MacOS/$(APP)
 	@codesign --force --sign - $(BUNDLE) 2>/dev/null || \
 	  echo "⚠️  ad-hoc 签名失败，开机自启可能不可用"
 	@echo "✅ 已生成 $(BUNDLE)"
 
-debug: $(SOURCES) Resources/Info.plist $(RESOURCES)
+debug: $(SOURCES) Resources/Info.plist $(RESOURCES) $(SOUND_FILES)
 	@rm -rf $(BUNDLE)
 	@mkdir -p $(CONTENTS)/MacOS $(CONTENTS)/Resources
 	@cp Resources/Info.plist $(CONTENTS)/Info.plist
 	@cp $(RESOURCES) $(CONTENTS)/Resources/
+	@cp -R $(SOUNDS_DIR) $(CONTENTS)/Resources/
 	$(SWIFTC) -Onone -g $(FLAGS) $(SOURCES) -o $(CONTENTS)/MacOS/$(APP)
 	@codesign --force --sign - $(BUNDLE) 2>/dev/null || true
 

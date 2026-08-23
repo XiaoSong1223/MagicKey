@@ -59,9 +59,10 @@ enum UIProbe {
 
     /// 装一次面板。**整个探针只调一次**——见下。
     static func mount(settings: Settings, engine: Engine, updates: UpdateChecker,
-                      audio: AudioStatusModel, metrics: PanelMetrics) {
+                      audio: AudioStatusModel, keySound: KeySoundController,
+                      metrics: PanelMetrics) {
         let view = MenuBarView(settings: settings, engine: engine, updates: updates,
-                               audio: audio, metrics: metrics)
+                               audio: audio, keySound: keySound, metrics: metrics)
         // 必须先关掉：给已显示的 popover 换控制器不会重算尺寸，
         // 后面量到的会是上一次 mount 的旧尺寸（这个坑本文件上面刚记过一次）。
         if popover.isShown { popover.performClose(nil); settle(0.3) }
@@ -199,6 +200,7 @@ enum UIProbe {
               engine: Engine(probe: .running),
               updates: UpdateChecker(),
               audio: AudioStatusModel(),
+              keySound: KeySoundController(),
               metrics: PanelMetrics())
         settle(0.6)
         // 验证「拖滑块时右侧数值跟着变」：程序化改 hi，看输入框认不认
@@ -273,7 +275,8 @@ enum UIProbe {
 
         popover.contentViewController = NSHostingController(
             rootView: MenuBarView(settings: settings, engine: engine, updates: updates,
-                                  audio: AudioStatusModel(), metrics: metrics))
+                                  audio: AudioStatusModel(), keySound: KeySoundController(),
+                                  metrics: metrics))
         popover.behavior = .transient
 
         func openPanel() {
@@ -375,7 +378,7 @@ enum UIProbe {
         let host = PanelHostingController(
             rootView: MenuBarView(settings: settings, engine: Engine(probe: .running),
                                   updates: UpdateChecker(), audio: AudioStatusModel(),
-                                  metrics: metrics))
+                                  keySound: KeySoundController(), metrics: metrics))
         host.popover = po
         po.contentViewController = host
         host.syncContentSize()
@@ -523,6 +526,85 @@ enum UIProbe {
         return failures
     }
 
+    /// 键盘音效：**未授权时必须什么都不装。**
+    ///
+    /// 这一条非测不可。「开着但没授权」是这个功能最常见的一态（默认关闭 →
+    /// 用户打开 → 还没去系统设置勾），而它的正确行为是**完全静默地什么都不做**：
+    /// 不装 monitor、不起音频引擎、不开定时器。写错了不会崩、不会报错，
+    /// 只会在系统里留下一条「这个 app 在监听输入」的记录，外加一个白跑的音频引擎——
+    /// 人工点击**永远发现不了**。
+    ///
+    /// ⚠️ 不能靠真实 TCC 状态来测：探针是从终端起的裸可执行文件，TCC 把它算在
+    /// **终端**头上（本机实测 `IOHIDCheckAccess` 返回「已授权」，那是终端的授权），
+    /// 于是「被拒绝」那一支永远走不到。所以用 `probeAccessOverride` 直接注入。
+    ///
+    /// 第三步是**阴性对照**：同样的开关、只把授权改成「已给」，就必须装上 monitor
+    /// 并把引擎跑起来。测不出差别的检查等于没有这个检查。
+    static func keySoundChecks(settings: Settings) -> [String] {
+        var failures: [String] = []
+        print("\n── 键盘音效：未授权降级 ──")
+
+        let controller = KeySoundController()
+        let originallyEnabled = settings.keySoundEnabled
+        defer {
+            // 别把监听留到探针后面的步骤里
+            settings.keySoundEnabled = false
+            KeySoundController.probeAccessOverride = nil
+            KeySoundController.setProbeLaunchAccess(nil)
+            controller.apply(settings)
+            settings.keySoundEnabled = originallyEnabled
+        }
+
+        /// - Parameters:
+        ///   - atLaunch: 「本进程启动那一刻」的授权结果
+        ///   - granted: 「现在」的授权结果。两者不同正是 ⑤ 要测的那件事
+        ///   - listening: 期望「装了 monitor 没有」
+        ///   - engineRunning: 期望「音频引擎在不在跑」。nil = 不作判据，只打印
+        func step(_ tag: String, enabled: Bool, atLaunch: Bool, granted: Bool,
+                  expect status: KeySoundStatus, listening: Bool, engineRunning: Bool?) {
+            KeySoundController.setProbeLaunchAccess(atLaunch)
+            KeySoundController.probeAccessOverride = granted
+            settings.keySoundEnabled = enabled
+            controller.apply(settings)
+            settle(0.4)
+
+            let gotListening = controller.probeIsListening
+            let gotEngine = controller.probeEngineIsRunning
+            var bad: [String] = []
+            if controller.status != status { bad.append("status=\(controller.status)") }
+            if gotListening != listening { bad.append("monitor=\(gotListening)") }
+            if let engineRunning, gotEngine != engineRunning { bad.append("engine=\(gotEngine)") }
+
+            print(String(format: "  %-30@ status=%-18@ monitor=%@ engine=%@  %@",
+                         tag as NSString, "\(controller.status)" as NSString,
+                         (gotListening ? "已装" : "未装") as NSString,
+                         (gotEngine ? "运行" : "停") as NSString,
+                         (bad.isEmpty ? "✅" : "❌ 期望 \(status)/\(listening)") as NSString))
+            if !bad.isEmpty {
+                failures.append("键盘音效「\(tag)」不对：" + bad.joined(separator: " "))
+            }
+        }
+
+        step("① 未授权 + 开关打开", enabled: true, atLaunch: false, granted: false,
+             expect: .needsPermission, listening: false, engineRunning: false)
+        step("② 已授权 + 开关关闭", enabled: false, atLaunch: true, granted: true,
+             expect: .off, listening: false, engineRunning: false)
+        // 阴性对照。引擎跑不跑还取决于采样能不能加载（探针走源码树里的
+        // Resources/Sounds，见 KeySoundPack.soundsRoot），所以它一起作为判据。
+        step("③ 已授权 + 开关打开（对照）", enabled: true, atLaunch: true, granted: true,
+             expect: .running, listening: true, engineRunning: true)
+        step("④ 撤销授权后再收敛一次", enabled: true, atLaunch: true, granted: false,
+             expect: .needsPermission, listening: false, engineRunning: false)
+        // ⑤ 最容易被写成绿灯的那一态：**跑起来之后才拿到的授权**。
+        // 「输入监控」对已运行的进程不生效，此刻装 monitor 一个事件都收不到，
+        // 面板却会亮绿灯说「响应中」——比直接报未授权糟得多。
+        // 判据必须同时压住三项：状态是 needsRestart、monitor 未装、引擎没起。
+        step("⑤ 启动时未授权，运行中才给", enabled: true, atLaunch: false, granted: true,
+             expect: .needsRestart, listening: false, engineRunning: false)
+
+        return failures
+    }
+
     /// 设置窗口每次打开都在屏幕正中
     static func settingsCenterChecks(settings: Settings, updates: UpdateChecker) -> [String] {
         print("\n── 设置窗口位置 ──")
@@ -570,9 +652,15 @@ enum UIProbe {
         let settings = Settings()
         let updates = UpdateChecker()
         let audio = AudioStatusModel()
+        let keySound = KeySoundController()
         let metrics = PanelMetrics()
         let engine = Engine(probe: .running)
         metrics.update(screen: NSScreen.main, menuBar: 33)
+
+        // 音效开着会多出状态行和音量行，面板就高一截。高度这一组要可复现，
+        // 所以显式摆成出厂状态（关闭）——探针自己的 UserDefaults 域里可能
+        // 留着上一次跑 keySoundChecks 时写进去的值。
+        settings.keySoundEnabled = false
 
         print("MagicKey UI 探针")
         print("屏幕可用高度上限 = \(Int(metrics.maxHeight))pt"
@@ -580,7 +668,7 @@ enum UIProbe {
 
         // 只装一次，之后全靠改绑定。理由见 measure 的注释。
         mount(settings: settings, engine: engine, updates: updates,
-              audio: audio, metrics: metrics)
+              audio: audio, keySound: keySound, metrics: metrics)
 
         var failures: [String] = []
         var overflow: [String] = []
@@ -617,7 +705,7 @@ enum UIProbe {
         let narrow = PanelMetrics()
         narrow.forceMaxHeight(300)
         mount(settings: settings, engine: engine, updates: updates,
-              audio: audio, metrics: narrow)
+              audio: audio, keySound: keySound, metrics: narrow)
         for kind in [EffectKind.staticLevel, .audioBeat] {
             settings.kind = kind
             let m = measure(label: kind.displayName, metrics: narrow)
@@ -631,7 +719,7 @@ enum UIProbe {
         // ── 4. Engine 五态 ─────────────────────────────────────────
         print("\n── Engine 五态 ──")
         mount(settings: settings, engine: engine, updates: updates,
-              audio: audio, metrics: metrics)
+              audio: audio, keySound: keySound, metrics: metrics)
         settings.kind = .breathe
         let phases: [(String, Engine.Phase)] = [
             ("运行中",     .running),
@@ -670,6 +758,35 @@ enum UIProbe {
         }
         updates.setProbeState(.idle)
 
+        // ── 5c. 键盘音效四态的面板高度 ─────────────────────────────
+        // 音效区在**所有**效果下都在，所以它撑高的是每一个面板。
+        // 未授权那一态还会多一行文字加一个按钮，是四态里最高的——
+        // 加控件之前先看这一行会不会顶到窄屏上限。
+        print("\n── 键盘音效五态（面板高度）──")
+        settings.kind = .breathe
+        let baseHeight = measure(label: "关闭", metrics: metrics).size.height
+        settings.keySoundEnabled = true
+        // 「需重开」那句文案是五态里最长的，最可能折行把面板顶高——
+        // 正因如此它必须在这一组里，不能只测好看的那几态。
+        for (name, s) in [("需要授权", KeySoundStatus.needsPermission),
+                          ("等待授权", .requesting),
+                          ("需重开",   .needsRestart),
+                          ("响应中",   .running)] {
+            keySound.setProbeStatus(s)
+            let m = measure(label: name, metrics: metrics)
+            let ok = abs(m.size.width - 360) < 1
+            print(String(format: "  开·%-8@ %6.0f×%.0fpt（关闭时 %.0fpt，+%.0f）  %@",
+                         name as NSString, m.size.width, m.size.height, baseHeight,
+                         m.size.height - baseHeight,
+                         (ok ? "✅" : "❌ 宽度被撑到 \(Int(m.size.width))") as NSString))
+            if !ok { failures.append("键盘音效「\(name)」撑宽了面板") }
+            if m.size.height <= baseHeight {
+                failures.append("键盘音效打开后面板没变高（「\(name)」那一区可能没画出来）")
+            }
+        }
+        settings.keySoundEnabled = false
+        keySound.setProbeStatus(.off)
+
         // ── 5b. 初始焦点：**只打印，不作判据** ────────────────────────
         //
         // 「打开面板时亮度输入框不该自动获得焦点」这条探针**测不了**。
@@ -702,6 +819,7 @@ enum UIProbe {
         // ── 7. 面板落点与设置窗口位置 ──────────────────────────────
         // 放在最后：settingsCenterChecks 会把 activationPolicy 切成 .regular，
         // 别让它影响前面那些尺寸测量。
+        failures += keySoundChecks(settings: settings)
         failures += anchorChecks()
         failures += focusChecks()
         failures += settingsCenterChecks(settings: settings, updates: updates)

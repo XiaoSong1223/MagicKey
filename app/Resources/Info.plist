@@ -44,6 +44,17 @@
     <key>NSAudioCaptureUsageDescription</key>
     <string>MagicKey 需要读取系统正在播放的声音，才能让键盘背光跟着音乐明暗变化。音频只在内存中实时换算成一个用于控制亮度的能量包络（响度），随即丢弃：不录音、不写入磁盘、不联网上传，进程内也没有任何能还原出声音内容的代码路径。</string>
 
+    <!-- 键盘敲击音效需要 TCC 的 kTCCServiceListenEvent（系统设置里叫「输入监控」），
+         但**它没有对应的 usage description 键，这里不需要加任何东西**。
+         核对方法（2026-08-23 实测）：
+           strings /System/Library/PrivateFrameworks/TCC.framework/Support/tccd \
+             | grep -E 'UsageDescription'
+         那份列表里有 NSAudioCaptureUsageDescription、NSMicrophoneUsageDescription 等
+         四十多个键，**没有**任何一个对应 ListenEvent——授权框的文案由系统自己提供
+         （「想要接收任何应用程序的按键」），app 无处插入自己的说明。
+         另外「输入监控」授权后必须退出重开才生效，这一点只能在界面上告诉用户，
+         见 KeySoundController.restartHint。 -->
+
     <key>NSHumanReadableCopyright</key>
     <string>MagicKey · MIT License</string>
 </dict>

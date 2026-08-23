@@ -154,6 +154,25 @@ final class Settings: ObservableObject {
         }
     }
 
+    /// 键盘音效。**默认关闭，且必须默认关闭**——它是本应用唯一需要
+    /// 「输入监控」授权的功能，那个权限的语义是「这个 app 能看到你按的每一个键」。
+    /// 默认打开等于替用户做了这个决定。
+    @Published var keySoundEnabled: Bool = Settings.bool("keySoundEnabled", false) {
+        didSet { Self.d.set(keySoundEnabled, forKey: "keySoundEnabled") }
+    }
+
+    /// 键盘音效的总音量 0–1。默认 0.6：三套包已经做过响度对齐，
+    /// 这个位置在 MacBook 内置扬声器上大致等于「听得见但不盖过视频」。
+    @Published var keySoundVolume: Double = Settings.double("keySoundVolume", 0.6) {
+        didSet { Self.d.set(keySoundVolume, forKey: "keySoundVolume") }
+    }
+
+    /// 音色包目录名。存字符串而不是枚举：以后加包只动 `KeySoundPack.all`，
+    /// 而已经存进 UserDefaults 的旧值遇到不认识的名字会退回默认包（见 `named`）。
+    @Published var keySoundPack: String = d.string(forKey: "keySoundPack") ?? KeySoundPack.fallback.id {
+        didSet { Self.d.set(keySoundPack, forKey: "keySoundPack") }
+    }
+
     /// 自动检查更新。**这是 App 唯一的网络请求**，所以给了明确的开关——
     /// DESIGN.md §5 的隐私红线要求网络行为可关闭。关掉之后进程不碰网络。
     @Published var autoCheckUpdates: Bool = Settings.bool("autoCheckUpdates", true) {

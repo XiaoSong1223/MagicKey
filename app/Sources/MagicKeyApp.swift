@@ -31,6 +31,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
     let engine: Engine
     let updates = UpdateChecker()
     let audio = AudioStatusModel()
+    /// 键盘敲击音效。**独立于 `engine`**：不共享事件流、不共享生命周期，
+    /// 背光不可用时它照样能用。
+    let keySound = KeySoundController()
     let metrics = PanelMetrics()
     private let idle = IdleMonitor()
     private var cancellables: [Any] = []
@@ -115,7 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
         // 不同步的话面板会整体右移下移各 20pt。理由见那个类的注释。
         let host = PanelHostingController(
             rootView: MenuBarView(settings: settings, engine: engine, updates: updates,
-                                  audio: audio, metrics: metrics,
+                                  audio: audio, keySound: keySound, metrics: metrics,
                                   openSettings: { [weak self] in self?.openSettings() }))
         host.popover = popover
         popover.contentViewController = host
@@ -311,6 +314,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
         idle.enabled = settings.stopWhenIdle
         idle.idleThreshold = settings.idleSeconds
         engine.apply(settings)
+        // 音效和背光引擎并列收敛，互不依赖：`engine.available == false` 时
+        // 这一行照样执行，没有背光键盘的机器仍然听得到声音。
+        keySound.apply(settings)
     }
 
     /// Cocoa 应用默认不处理 SIGTERM——`killall`、`pkill`、部分注销/关机路径
@@ -324,6 +330,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
             src.setEventHandler { [weak self] in
                 MainActor.assumeIsolated {
                     self?.engine.shutdown(reason: "收到终止信号")
+                    self?.keySound.shutdown()
                     self?.idle.stop()
                     exit(0)
                 }
@@ -337,6 +344,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
     /// 和上面的信号处理覆盖。
     func applicationWillTerminate(_ notification: Notification) {
         engine.shutdown(reason: "应用退出")
+        keySound.shutdown()
         idle.stop()
     }
 

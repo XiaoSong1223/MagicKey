@@ -21,6 +21,7 @@ struct SettingsView: View {
         Form {
             generalSection
             if settings.kind != .staticLevel { effectSection }
+            keySoundSection
             updateSection
             aboutSection
         }
@@ -105,6 +106,33 @@ struct SettingsView: View {
             Text("静息亮度太靠近主面板的「亮度」时，「亮度」会被自动抬高，两者至少相差 5%。")
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    // MARK: - 键盘音效
+
+    /// **只放音色。** 开关和音量是每天要碰的，留在主面板；音色是选一次就忘的，
+    /// 放这里正好——判据和这一页其余分组一致，见类注释。
+    private var keySoundSection: some View {
+        Section("键盘音效") {
+            Picker("音色", selection: $settings.keySoundPack) {
+                ForEach(KeySoundPack.all) { pack in
+                    Text(pack.displayName).tag(pack.id)
+                }
+            }
+            .accessibilityLabel("键盘音效音色")
+            .accessibilityValue(KeySoundPack.named(settings.keySoundPack).displayName)
+            .help("三套都是真实机械键盘的录音，已做过响度对齐，换音色不会顺带换音量")
+
+            VStack(alignment: .leading, spacing: 6) {
+                // 开关不在这一页，不说的话用户会在这里找它
+                Text("开关和音量在菜单栏面板里。首次开启需要授予「输入监控」权限，"
+                     + "授权后要退出并重新打开 MagicKey 才生效。")
+                Text("采样来自 kbsim（github.com/tplai/kbsim），MIT 许可，作者 Thomas Lai。"
+                     + "完整说明见应用包内的 Sounds/CREDITS.md。")
+            }
+            .font(.caption).foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
         }
     }
 

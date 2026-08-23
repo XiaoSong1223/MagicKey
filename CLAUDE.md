@@ -18,6 +18,8 @@ macOS 菜单栏应用，给 MacBook 内置键盘背光加动态效果（呼吸/�
 `NSEvent.addGlobalMonitorForEvents` 都要 **Input Monitoring 权限**。
 2026-08-05 论证后**决定不付这个代价**，理由见「后续工作 v0.2」。
 下次再有人提这个需求，不要再重新论证一遍权限，直接看那一条。
+（2026-08-23 起这条有了边界：**键盘敲击音效**作为默认关闭的可选功能付了这个权限，
+见 `KeySoundController`。但**背光线仍然零权限**，键位过滤依旧不做，两条线别混。）
 
 所以整个引擎只做一件事：**决定一个 0–1 的数值随时间怎么变**。
 任何涉及颜色、分区、空间移动的需求都要直接否掉，不要尝试绕。
@@ -89,6 +91,7 @@ xcrun --sdk macosx --show-sdk-version   # → 26.5
 | 面板打开即可操作（焦点） | ✅ 锚点改 `.nonactivatingPanel` 拉活应用，探针带阴性对照 |
 | UI 探针 `make probe-ui` | ✅ 高度/收缩/窄屏/五态/更新五态/面板落点/面板焦点/设置窗口居中 |
 | 状态还原 **六个时机** | ✅ 全部实测：正常退出、手动停止、崩溃重启、系统睡眠、SIGTERM、锁屏 |
+| 键盘敲击音效 `KeySound*`（需「输入监控」，默认关） | ⚠️ 代码+探针全绿、许可证已核（kbsim/MIT）；**待真机授权+试听定默认音色** |
 
 ### 性能实测（30 分钟长测，10.8 万帧）
 
@@ -137,6 +140,9 @@ xcrun --sdk macosx --show-sdk-version   # → 26.5
       **这条 2026-08-06 已被实测推翻**（见「踩过的坑」），不再是推迟的理由；③ 会推翻「零权限」这条产品线。
       真要做时：`CGEventTap` 监听 `.keyDown` 取 keycode，做成默认关闭的可选项，
       未授权时静默降级回纯 `KeyRepeatFilter` 行为。
+      （2026-08-23 注：键盘音效已把「输入监控」做成可选项且用的是 `NSEvent` 监听而非
+      `CGEventTap`——真要做黑名单时优先挂在 `KeySoundController` 的事件流上，
+      对已为音效授权的用户权限成本为零。）
 - [ ] 按键脉冲叠加在呼吸底色上（`EffectStack` 的瞬时层就是为这个建的，至今没人调用 `push()`）
 - [ ] **CLI + URL Scheme** ← 这是最被低估的功能，见下方说明
 - [ ] 全局快捷键切换效果
@@ -397,6 +403,8 @@ built-in 菜单栏上控制中心从 900pt 起往右排，于是留给第三方�
 
 实测各效果面板高：常亮 326/457、呼吸心跳频闪 390/634、按键脉冲 409/653、
 音乐律动 473/717（折叠/展开）。**加新控件前先对着这组数看会不会顶到屏幕上限。**
+（2026-08-23 音效区并入后的现值：常亮 321、呼吸类 349、音乐 404、不受支持 219；
+音效开启再 +26（响应中）或 +51（警示态）。以 `make probe-ui` 输出为准。）
 
 > 量这些数不需要人工点击：`NSStatusItem.button` 上 `performClick(nil)` 就能程序化
 > 打开面板，再读 `NSPopover.contentViewController.view.frame` 和内部 `NSScrollView` 的
@@ -549,6 +557,21 @@ x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_A
 
 核对方法：`strings /System/Library/ExtensionKit/Extensions/SecurityPrivacyExtension.appex/Contents/MacOS/SecurityPrivacyExtension | grep -oE 'Privacy_[A-Za-z]+'`。
 **不能靠 `open` 试**——锚点写错时它照样返回 0，只是打开了错误的面板。
+**但 strings 那个 Mach-O 查不全**（2026-08-23）：里面只有硬编码在代码里的十来个锚点，
+「输入监控」的 `Privacy_ListenEvent` 就不在其中。完整的表在同 bundle 的
+`Contents/Resources/TCCServiceList.plist`——`kTCCService…` 条目的
+`revealElementKeyName` 字段才是锚点名。先查 plist，再拿 strings 兜底。
+
+**「输入监控」有三个和别的 TCC 权限都不一样的脾气**（2026-08-23，键盘音效实测）：
+① **授权对已运行进程不生效**，必须退出重开——勾完之后 `IOHIDCheckAccess` 立刻返回
+「已授权」，但 `NSEvent` 全局监听装上去一个事件都收不到。只看当前值就会亮着绿灯却无声，
+所以 `KeySoundController` 存了 `grantedAtLaunch` 快照：现在有、启动时没有 →
+`.needsRestart` 态（不装 monitor），面板给一键重开。
+② **没有 usage description 键**：tccd 的 UsageDescription 列表里没有 ListenEvent
+对应项，授权框文案由系统给定，Info.plist 里加什么都没用（核对命令在 Info.plist 注释里）。
+③ **探针测不到「被拒绝」**：从终端起的裸可执行文件，TCC 把它算在**终端**头上
+（实测返回终端的「已授权」），降级分支永远走不到——必须 `probeAccessOverride` 注入，
+launch 快照同理要 `setProbeLaunchAccess` 可注入。
 
 **「丢档比例」不是感知指标。** 判据是最大**相对**亮度步进（韦伯定律）。
 高亮度区跳 3 档只有 2% 变化看不出来，档位 2 附近跳 3 档是 150% 一眼可见。

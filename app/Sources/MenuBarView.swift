@@ -20,6 +20,7 @@ struct MenuBarView: View {
     @ObservedObject var engine: Engine
     @ObservedObject var updates: UpdateChecker
     @ObservedObject var audio: AudioStatusModel
+    @ObservedObject var keySound: KeySoundController
     @ObservedObject var metrics: PanelMetrics
 
     /// 打开设置窗口。由 AppDelegate 注入，视图不认识窗口控制器。
@@ -152,16 +153,23 @@ struct MenuBarView: View {
 
     @ViewBuilder
     private var middle: some View {
-        if engine.available {
-            VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 14) {
+            if engine.available {
                 EffectGrid(selection: $settings.kind)
                 effectStatusRow
                 brightnessRow
                 if settings.kind != .staticLevel { speedRow }
                 if settings.kind == .audioBeat { sensitivityRow }
+            } else {
+                unsupportedNotice
             }
-        } else {
-            unsupportedNotice
+
+            // 音效**不在** `engine.available` 的分支里：它跟背光硬件没有关系，
+            // 没有背光键盘的机器（或私有接口探测失败时）照样该能用。
+            // 顺带保住探针那条「不受支持时面板必须更矮」的判据——
+            // 两个分支都加同样高的一块，相对高度不变。
+            Divider()
+            keySoundSection
         }
     }
 
@@ -214,6 +222,108 @@ struct MenuBarView: View {
             EmptyView()
         }
     }
+
+    // MARK: - 键盘音效
+
+    /// 敲击音效。**和上面的效果是两条独立的线**：那条控制背光亮度，这条只出声，
+    /// 互不影响，也可以同时开。
+    ///
+    /// 折叠得很紧：关着的时候只有一行（标题 + 开关），因为这是绝大多数人
+    /// 绝大多数时候看到的样子。打开之后才长出状态行和音量。
+    private var keySoundSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "speaker.wave.2.fill")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 14)
+
+                Text("键盘音效")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                Toggle("", isOn: $settings.keySoundEnabled)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .accessibilityLabel("键盘音效开关")
+                    .accessibilityValue(settings.keySoundEnabled ? "已开启" : "已关闭")
+                    .help(settings.keySoundEnabled
+                          ? "关闭敲击音效"
+                          : "敲键盘时播放机械键盘声。需要「输入监控」权限")
+            }
+
+            if settings.keySoundEnabled {
+                // 正常工作时不占一行说「响应中」——声音本身就是反馈，
+                // 那一行只有在**出了问题**的时候才有信息量。
+                if keySound.status != .running { keySoundStatusRow }
+                keySoundVolumeRow
+            }
+        }
+    }
+
+    private var keySoundStatusRow: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Circle()
+                .fill(keySoundTint)
+                .frame(width: 6, height: 6)
+                .padding(.top, 4)
+            Text(keySound.summary)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 4)
+            keySoundActionButton
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("键盘音效状态：\(keySound.summary)")
+    }
+
+    private var keySoundTint: Color {
+        switch keySound.tint {
+        case .good:    return .green
+        case .warn:    return .orange
+        case .bad:     return .red
+        case .neutral: return .secondary
+        }
+    }
+
+    @ViewBuilder
+    private var keySoundActionButton: some View {
+        switch keySound.action {
+        case .grant:
+            Button("授权") { keySound.requestAccess() }
+                .buttonStyle(.link).font(.caption)
+                .help("弹出系统的「输入监控」授权框。" + KeySoundController.restartHint)
+        case .openSettings:
+            Button("打开设置") { keySound.openInputMonitoringSettings() }
+                .buttonStyle(.link).font(.caption)
+                .help(KeySoundController.restartHint)
+        case .restart:
+            Button("重新打开") { keySound.restartApp() }
+                .buttonStyle(.link).font(.caption)
+                .help("退出并立即重新启动 MagicKey，让「输入监控」授权生效。"
+                      + "键盘背光会照常还原，设置不会丢")
+        case nil:
+            EmptyView()
+        }
+    }
+
+    /// 二十档。和「快慢」一样，吸附放在 binding 的 setter 里做，
+    /// **不传 `Slider(step:)`**——传了 AppKit 就换成带刻度的细滑块，
+    /// 和上面「亮度」那个圆头对不上。
+    private var keySoundVolumeRow: some View {
+        paramRow("音量",
+                 value: percent(settings.keySoundVolume),
+                 help: "敲击音效的音量。它在系统音量之下，静音时同样不出声",
+                 binding: Binding(get: { Self.snapVolume(settings.keySoundVolume) },
+                                  set: { settings.keySoundVolume = Self.snapVolume($0) }),
+                 in: 0...1)
+    }
+
+    private static func snapVolume(_ v: Double) -> Double { (v / 0.05).rounded() * 0.05 }
 
     // MARK: - 参数
 
