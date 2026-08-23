@@ -60,15 +60,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private func bringToFront() {
         AppWindows.willOpen(self)
         window?.makeKeyAndOrderFront(nil)
-
-        // 窗口没成为 key 时 AppKit 会把所有控件画成非活跃样式（开关掉色、
-        // 滑块头低对比），看起来像配色问题。真出问题时先看这行，别去调颜色。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            let w = self?.window
-            Log.write("[settings] isActive=\(NSApp.isActive) "
-                      + "isKey=\(w?.isKeyWindow ?? false) "
-                      + "policy=\(NSApp.activationPolicy().rawValue)")
-        }
+        // 开完之后的自查（isKey / onActiveSpace / policy）由 `AppWindows` 统一打，
+        // 两个窗口共用一行格式，别在这里再写一份。
     }
 
     /// 关掉设置窗口**不退出应用**——`applicationShouldTerminateAfterLastWindowClosed`

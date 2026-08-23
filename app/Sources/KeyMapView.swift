@@ -15,6 +15,16 @@ struct KeyMapView: View {
 
     /// 当前点开了哪个键的小面板。nil = 没点开
     @State private var openedKey: KeyCap?
+
+    #if UI_PROBE
+    /// **只在 UI 探针里编译。** 一挂上就当作那个键被点开了。
+    ///
+    /// 「小面板弹在哪」没法靠遍历视图去查（SwiftUI 的子视图在进程内查不到，
+    /// 见 `UIProbe.accessibilityTree` 那段注释），只能把 `_NSPopoverWindow`
+    /// 的实际 frame 量出来比。而要量就得先让它弹出来，点击又模拟不了，
+    /// 所以留这个口子直接种进 `@State`。
+    var probeOpenKeyCode: UInt16? = nil
+    #endif
     /// 导入失败的原因。贴在「导入…」按钮下面，不弹对话框——
     /// 一次可以选多个文件，其中几个不合格时对话框要弹好几次
     @State private var importProblem: String?
@@ -27,6 +37,13 @@ struct KeyMapView: View {
             Divider()
             librarySection
         }
+        #if UI_PROBE
+        .onAppear {
+            if let code = probeOpenKeyCode {
+                openedKey = KeyboardLayout.keys.first { $0.keyCode == code }
+            }
+        }
+        #endif
         .frame(minWidth: 700, idealWidth: 760, maxWidth: .infinity)
         .frame(minHeight: 500, idealHeight: 620, maxHeight: .infinity)
         .confirmationDialog(
@@ -120,7 +137,6 @@ struct KeyMapView: View {
             .contentShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
         }
         .buttonStyle(.plain)
-        .offset(x: cap.x * unit + 1, y: cap.y * unit + 1)
         .help(assigned.map { "\(cap.name)：\($0.displayName)" } ?? "\(cap.name)：未指定")
         .accessibilityLabel(cap.name)
         .accessibilityValue(assigned?.displayName ?? "未指定")
@@ -129,10 +145,12 @@ struct KeyMapView: View {
         // 小面板会飘在整张键盘的正中间，和点的那个键对不上。
         .popover(item: Binding(
             get: { openedKey?.keyCode == cap.keyCode ? cap : nil },
-            set: { if $0 == nil { openedKey = nil } })
+            set: { if $0 == nil { openedKey = nil } }),
+            arrowEdge: .top
         ) { key in
             keyPopover(key)
         }
+        .offset(x: cap.x * unit + 1, y: cap.y * unit + 1)
     }
 
     // MARK: - 单个键的小面板

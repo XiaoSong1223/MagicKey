@@ -524,6 +524,42 @@ SwiftUI 布局跑完后宿主视图是 360×300，AppKit 把窗口撑成 386×32
 **探针那四步是有阴性对照的**：把锚点换回按钮，③ 立刻报上移 11pt、④ 报上移 193pt。
 一个查不到东西的检查报通过比没有这个检查更糟，落点这种「看着差不多」的东西尤其要对照。
 
+**菜单栏应用的窗口不要主动跨进别人的全屏 Space；父窗口进得去，不代表菜单等
+子窗口也进得去。**（2026-08-23，VSCode 全屏下点「设置」）
+
+`NSWindow` 默认 `.managed`，属于**创建时那块 Space**。菜单栏应用的窗口偏偏总是在
+「用户正全屏用着别的 app」时被开出来，于是**行为在两种之间随机摇摆**：
+
+- 系统整块切到桌面 Space 去显示它——「点设置，画面跳回主桌面」，一切正常；
+- 窗口留在桌面 Space 而用户还在全屏里，**什么都没看见**。从设置里点
+  「自定义按键音…」开不出窗口就是这一种。
+
+第二种**不报任何错**：`isActive=true`、`isKey=true`、`policy=0` 全绿（实测日志就是
+这样），只有 `window.isOnActiveSpace` 是 false。所以 `AppWindows` 那行自查里
+**`onActiveSpace` 一项不能少**，缺了它只能靠猜。
+
+看似自然的修法是加 `.moveToActiveSpace` 让窗口跟着用户走，或再加
+`.fullScreenAuxiliary` 让它直接寄居在别人的全屏 Space 上。但这些标志都不能
+可靠传给窗口里弹出的子窗口，而设置窗口里最要紧的两样东西正是子窗口，于是全坏：
+
+- `Picker` 弹出的 `NSMenu` 算不对可用高度 → 12 套音色的下拉**只显示一项**；
+- 键盘图上点键弹的 `NSPopover` 被钳到屏幕原点 → **每个键的小面板都出现在左上角**。
+
+`.moveToActiveSpace` 在两块显示器各自使用独立 Space 时也会把窗口拽到外接屏的
+全屏 Space，复现同一类子窗口故障；`.canJoinAllSpaces` 也不能加。所以
+`AppWindows.keepOnPlacedSpace` **显式移除 `.moveToActiveSpace`、
+`.fullScreenAuxiliary` 和 `.canJoinAllSpaces`**，让独立窗口保持默认 `.managed`，
+探针用阴性对照守住这三个标志（它们很容易被当成「漏了」补回来）。
+面板锚点那个 2pt 透明窗口是另一回事——它自己就是全部内容、没有子窗口，
+所以那边该用 `.canJoinAllSpaces + .fullScreenAuxiliary`，两处别互相照抄。
+
+**顺带一条排查教训：`.offset` 不影响 `.popover` 的锚点。**
+「小面板全弹在左上角」第一反应是「键位用 `.offset` 摆位，而 `.offset` 不改布局矩形，
+popover 锚的是布局矩形」——听起来严丝合缝，**实测是错的**。
+把改动退回 `.offset` 再量，两个键的小面板位置一模一样（位移 340pt = 两键间距，
+和用 `.padding` 占位时相同）。**阴性对照救了这一次**：不做对照就会把一个
+无关的布局改动当成修复提交上去，真正的 Space 问题原地不动。
+
 **`NSWindow(contentViewController:)` 装 SwiftUI 时，尺寸要等第一次布局才定得下来。**
 建完那一刻窗口是 **0×32**，拿它算居中，偏差正好是半个窗口（探针报过 `(+240, +210)`）。
 `window.layoutIfNeeded()` 不够——它不改窗口尺寸；要 `contentView.layoutSubtreeIfNeeded()`
@@ -542,7 +578,8 @@ SwiftUI 布局跑完后宿主视图是 360×300，AppKit 把窗口撑成 386×32
 在浅色背景里几乎看不见。看起来完全像配色没调好。
 解法是开窗前先 `setActivationPolicy(.regular)`，`windowWillClose` 里切回
 `.accessory`（切回要推迟一个 runloop，否则 AppKit 在关闭流程半途重排菜单栏和 Dock）。
-**判据**：`Log` 里那行 `[settings] isActive=… isKey=…`。
+**判据**：`Log` 里那行 `[window] <标题> isActive=… isKey=… onActiveSpace=… policy=…`
+（由 `AppWindows.willOpen` 统一打，设置窗口和键盘图窗口共用）。
 （2026-08-23 起有两个独立窗口——设置和自定义按键音键盘图。切回 `.accessory`
 的判据从「我这个窗口关了」变成「**所有**窗口都关了」，逻辑集中在 `AppWindows`：
 集合计数、推迟一拍后落地前再验一次。新加窗口必须走它，别自己再写一份。）

@@ -527,6 +527,24 @@ enum UIProbe {
         return failures
     }
 
+    /// 设置里的音色 Picker 直接遍历这张表。先把「本来就只有一项」这种数据回归
+    /// 钉死，和后面的全屏 Space 呈现问题分开判断。
+    static func keySoundPackInventoryChecks() -> [String] {
+        print("\n── 键盘音效：内置音色清单 ──")
+        let packs = KeySoundPack.all
+        let ids = Set(packs.map(\.id))
+        let allResolvable = packs.allSatisfy { KeySoundPack.named($0.id).id == $0.id }
+        let ok = packs.count == 12 && ids.count == packs.count && allResolvable
+        print("  \(packs.count) 套、\(ids.count) 个不重复 ID、"
+              + "全部可按 Picker tag 解析  \(ok ? "✅" : "❌")")
+
+        var failures: [String] = []
+        if packs.count != 12 { failures.append("内置音色应有 12 套，实际 \(packs.count) 套") }
+        if ids.count != packs.count { failures.append("内置音色 ID 有重复") }
+        if !allResolvable { failures.append("有音色的 Picker tag 无法解析回对应音色") }
+        return failures
+    }
+
     /// 键盘音效：**未授权时必须什么都不装。**
     ///
     /// 这一条非测不可。「开着但没授权」是这个功能最常见的一态（默认关闭 →
@@ -1150,6 +1168,13 @@ enum UIProbe {
             }
         }
 
+        // ①b Space 行为。**这一条只验标志位，验不了行为**——真正的判据
+        // 「别的 app 全屏时菜单仍能完整展开」需要另一个进程占着全屏 Space，
+        // 进程内造不出来。但误加任一跨 Space 标志就是这个 bug 的成因，而且
+        // 很容易被当作「让窗口跟着用户走」的修复补回来，所以这里反向守住它。
+        failures += spaceNormalizationCheck()
+        failures += spaceBehaviorCheck("①b 键盘图", win)
+
         // ② 再开一次必须是同一个窗口（单例），不能叠出第二个
         KeyMapWindowController.show(store: store, settings: settings)
         settle(0.5)
@@ -1160,6 +1185,9 @@ enum UIProbe {
         // ③ 两个窗口都开着，关掉设置窗口 —— **策略必须还停在 regular**
         SettingsWindowController.show(settings: settings, updates: updates)
         settle(0.8)
+        if let sw = NSApp.windows.first(where: { $0.title == "MagicKey 设置" }) {
+            failures += spaceBehaviorCheck("①c 设置", sw)
+        }
         let bothOpen = "\(policy())/anyOpen=\(AppWindows.anyOpen)"
         NSApp.windows.first { $0.title == "MagicKey 设置" }?.performClose(nil)
         settle(0.8)
@@ -1188,6 +1216,130 @@ enum UIProbe {
         if !noneOpen { failures.append("窗口全关掉了，AppWindows.anyOpen 却还报 true") }
 
         return failures
+    }
+
+    /// 小面板必须锚在**被点的那个键**上，不能都弹在左上角。
+    ///
+    /// ## 为什么这一条非有不可
+    ///
+    /// 键盘图是 `ZStack(alignment: .topLeading)` + 每个键各自 `.offset` 摆位的。
+    /// `.offset` 只在画的时候平移，**不改布局矩形**——每个键的布局矩形都还压在
+    /// ZStack 左上角，而 `.popover` 锚的正是布局矩形，于是点哪个键小面板都弹在
+    /// 左上角（2026-08-23 用户报告）。改成 `.padding` 占位之后位置才跟着走。
+    /// 这类「画对了但布局没对」的错误肉眼在静态截图上看不出来，只能量。
+    ///
+    /// 判据取**两个键之间的位移**而不是绝对坐标：位移只和 `unit` 有关，
+    /// 不需要知道键盘图在窗口里的内边距，而且出错时的表现极干净——
+    /// 旧代码下两个键的小面板位置完全相同，位移是 0。
+    static func keyPopoverAnchorChecks(store: CustomSoundStore, settings: Settings) -> [String] {
+        print("\n── 自定义按键音：小面板锚在自己那个键上 ──")
+        var failures: [String] = []
+
+        // 避开最左最右：靠边时 NSPopover 会被窗口边缘钳住，量到的就不是锚点了
+        func key(nearX x: Double) -> KeyCap? {
+            KeyboardLayout.keys.min { abs($0.x - x) < abs($1.x - x) }
+        }
+        guard let a = key(nearX: 3), let b = key(nearX: 10), a.keyCode != b.keyCode else {
+            return ["键位表里找不到两个可用来对比的键"]
+        }
+
+        let contentWidth: CGFloat = 760
+        let unit = (contentWidth - 32) / CGFloat(KeyboardLayout.unitsWide)
+
+        /// 开一个只装 `KeyMapView` 的窗口，量小面板相对窗口原点的中心。
+        /// 不走 `KeyMapWindowController`：那是单例，还会来回切激活策略，
+        /// 这一组只关心几何。
+        func popoverCenter(_ cap: KeyCap) -> CGPoint? {
+            let host = NSHostingController(
+                rootView: KeyMapView(store: store, settings: settings,
+                                     probeOpenKeyCode: cap.keyCode))
+            let win = NSWindow(contentViewController: host)
+            win.title = "探针键盘图"
+            win.setContentSize(NSSize(width: contentWidth, height: 652))
+            win.setFrameOrigin(NSPoint(x: 200, y: 200))
+            win.makeKeyAndOrderFront(nil as Any?)
+            settle(1.2)
+            // **必须按「中心落在宿主窗口里」挑，不能取第一个可见的 popover。**
+            // 探针前面几组（面板落点、面板焦点）留下的 `_NSPopoverWindow` 实例
+            // 还在 `NSApp.windows` 里，其中一个是可见的——取第一个会量到它，
+            // 而它的位置和本组的窗口无关，两次测出来一模一样，
+            // 于是「位移 0」这个**恰好等于 bug 表现**的假结果就出来了。
+            let pop = NSApp.windows.first {
+                String(describing: type(of: $0)).contains("NSPopoverWindow")
+                    && $0.isVisible
+                    && win.frame.contains(CGPoint(x: $0.frame.midX, y: $0.frame.midY))
+            }
+            let center = pop.map {
+                CGPoint(x: $0.frame.midX - win.frame.minX, y: $0.frame.midY - win.frame.minY)
+            }
+            win.close()
+            settle(0.5)
+            return center
+        }
+
+        guard let ca = popoverCenter(a), let cb = popoverCenter(b) else {
+            return ["小面板没弹出来，量不到位置（probeOpenKeyCode 没生效？）"]
+        }
+
+        let expected = CGFloat(b.x - a.x) * unit
+        let got = cb.x - ca.x
+        let ok = abs(got - expected) <= 12
+        print(String(format: "  「%@」中心 x=%.0f，「%@」中心 x=%.0f；位移 %.0f（应为 %.0f）  %@",
+                     a.name as NSString, ca.x, b.name as NSString, cb.x,
+                     got, expected, (ok ? "✅" : "❌") as NSString))
+        if !ok {
+            failures.append(String(format: "小面板没跟着键走：「%@」和「%@」相距 %.0fpt，"
+                                   + "小面板却只差 %.0fpt（0 = 全都弹在左上角）",
+                                   a.name, b.name, expected, got))
+        }
+        return failures
+    }
+
+    /// 窗口的 Space 行为：**三个标志一个都不能有。**
+    ///
+    /// 窗口摆在哪由 `centerOnActiveScreen` 决定（鼠标所在那块屏）。任何一个
+    /// Space 标志都会让系统再把它挪进别人的全屏 Space，而**标志不传给子窗口**——
+    /// 窗口看着好好的，里面 `Picker` 的菜单只剩一行、键盘图小面板全弹到左上角。
+    /// 这些标志都踩过坑（2026-08-23），所以这一条是**反向**守的：
+    /// 后来人很容易觉得「全屏下窗口不出现是不是漏了 fullScreenAuxiliary」而补上去。
+    ///
+    /// 只验标志位，验不了行为——进程内造不出别的应用的全屏 Space
+    /// （`--repro-fullscreen` 造的是本进程的，复现不出来）。
+    private static func spaceBehaviorCheck(_ tag: String, _ w: NSWindow) -> [String] {
+        let cb = w.collectionBehavior
+        let bad = [(".moveToActiveSpace", cb.contains(.moveToActiveSpace)),
+                   (".fullScreenAuxiliary", cb.contains(.fullScreenAuxiliary)),
+                   (".canJoinAllSpaces", cb.contains(.canJoinAllSpaces))]
+            .filter { $0.1 }.map { $0.0 }
+        print("  \(tag)窗口 collectionBehavior=\(cb.rawValue)"
+              + "（Space 标志应为空）  \(bad.isEmpty ? "✅" : "❌ 带了 \(bad)")")
+        guard !bad.isEmpty else { return [] }
+        return ["\(tag)窗口带了 Space 标志 \(bad.joined(separator: " "))："
+                + "窗口会被挪进别人的全屏 Space，而标志不传给子窗口——"
+                + "音色下拉只剩一行、键盘图小面板全弹到左上角"]
+    }
+
+    /// 阴性对照：不只查真实窗口现在碰巧没带标志，还要证明归一化逻辑真的会
+    /// 清掉它们。保留 `.participatesInCycle` 则防止实现被写成粗暴的整体覆盖。
+    private static func spaceNormalizationCheck() -> [String] {
+        // `.moveToActiveSpace` 和 `.canJoinAllSpaces` 不能同时存在，AppKit 会直接
+        // 抛 NSInternalInconsistencyException，所以必须逐项种进三个窗口。
+        let dangerous: [NSWindow.CollectionBehavior] = [
+            .moveToActiveSpace, .fullScreenAuxiliary, .canJoinAllSpaces
+        ]
+        let results = dangerous.map { flag -> Bool in
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 80, height: 80),
+                             styleMask: [.titled], backing: .buffered, defer: false)
+            w.collectionBehavior = [flag, .participatesInCycle]
+            AppWindows.keepOnPlacedSpace(w)
+            return !w.collectionBehavior.contains(flag)
+                && w.collectionBehavior.contains(.participatesInCycle)
+        }
+        let ok = results.allSatisfy { $0 }
+        print("  ①a Space 归一化阴性对照：危险标志已清、无关标志"
+              + "\(ok ? "保留" : "未正确处理")  \(ok ? "✅" : "❌")")
+        guard !ok else { return [] }
+        return ["Space 行为归一化失效：危险标志未清干净，或误删了无关窗口行为"]
     }
 
     /// 设置窗口每次打开都在屏幕正中
@@ -1222,11 +1374,157 @@ enum UIProbe {
         return [String(format: "设置窗口没居中，偏差 (%+.1f, %+.1f)", dx, dy)]
     }
 
+    /// `--repro-fullscreen`：自己造一块真的全屏 Space，在里面开设置窗口，
+    /// 把 12 项音色菜单弹出来截图。
+    ///
+    /// 用户报的两条（音色下拉只剩一项、键盘图小面板全弹左上角）**只在全屏下出现**，
+    /// 而在这之前已经猜错两次原因（`.offset` 不影响 popover 锚点；菜单也没有被
+    /// 可用高度挤住——窗口压到屏底时它会向上翻转、12 项全在）。猜不动了，只能复现。
+    ///
+    /// ⚠️ 这不是「别的 app 全屏」的完美等价物：这里造出来的 Space 属于本进程。
+    /// 但「managed 窗口 vs 全屏 Space」这个机制是同一套，够用来做判据。
+    /// 放在**第二块屏**上做，不占用户正在用的那块。
+    static func reproFullscreen() {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate()
+
+        let target = NSScreen.screens.count > 1 ? NSScreen.screens[1] : NSScreen.screens[0]
+        let v = target.visibleFrame
+        let host = NSWindow(contentRect: NSRect(x: v.minX + 60, y: v.minY + 60,
+                                                width: 900, height: 600),
+                            styleMask: [.titled, .closable, .resizable],
+                            backing: .buffered, defer: false)
+        host.title = "假装成全屏的别的应用"
+        host.makeKeyAndOrderFront(nil as Any?)
+        settle(1.0)
+        host.toggleFullScreen(nil)
+        settle(3.5)
+        print("宿主窗口 全屏=\(host.styleMask.contains(.fullScreen)) "
+              + "onActiveSpace=\(host.isOnActiveSpace) frame=\(host.frame)")
+
+        let settings = Settings()
+        SettingsWindowController.show(settings: settings, updates: UpdateChecker())
+        settle(2.0)
+        guard let win = NSApp.windows.first(where: { $0.title == "MagicKey 设置" }),
+              let root = win.contentView else {
+            print("❌ 设置窗口没开出来"); host.toggleFullScreen(nil); settle(2.0); exit(1)
+        }
+        print("设置窗口 onActiveSpace=\(win.isOnActiveSpace) frame=\(win.frame)")
+        print("        screen=\(win.screen.map { "\($0.frame)" } ?? "nil")")
+        print("        collectionBehavior=\(win.collectionBehavior.rawValue)")
+        print("宿主此刻 onActiveSpace=\(host.isOnActiveSpace)")
+
+        guard let pop = allPopUps(root).max(by: { $0.frame.width < $1.frame.width }) else {
+            print("❌ 没找到下拉框"); host.toggleFullScreen(nil); settle(2.0); exit(1)
+        }
+        let path = "/private/tmp/claude-501/-Users-xiaosongxiaosong-Documents-MagicKey/"
+                 + "23c17b13-e1d0-4b03-acbd-88d060201b54/scratchpad/fullscreen.png"
+        Thread.detachNewThread {
+            Thread.sleep(forTimeInterval: 1.5)
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            // -C 带上所有屏，省得又截错那一块
+            p.arguments = ["-x", "-C", path]
+            try? p.run(); p.waitUntilExit()
+            print("截图 → \(path)")
+            DispatchQueue.main.async {
+                host.toggleFullScreen(nil)
+                settle(2.5)
+                exit(0)
+            }
+        }
+        pop.performClick(nil)
+        settle(8.0)
+        exit(0)
+    }
+
+    /// `--dump-picker`：把设置窗口里那几个 `NSPopUpButton` 的菜单项全打出来。
+    ///
+    /// 用户报「音色下拉只有一项」。在动任何布局之前先分清两件事：
+    /// **是菜单本身只有一项（数据/绑定的问题），还是菜单有 12 项但显示不出来
+    /// （呈现/Space 的问题）**。这两者的界面表现一模一样，猜不出来，只能查。
+    static func dumpPicker() {
+        let settings = Settings()
+        SettingsWindowController.show(settings: settings, updates: UpdateChecker())
+        settle(1.2)
+        guard let win = NSApp.windows.first(where: { $0.title == "MagicKey 设置" }),
+              let root = win.contentView else {
+            print("❌ 没找到设置窗口"); exit(1)
+        }
+        func walk(_ v: NSView, _ depth: Int) {
+            if let pop = v as? NSPopUpButton {
+                print("NSPopUpButton  frame=\(pop.frame)  enabled=\(pop.isEnabled)")
+                print("  numberOfItems = \(pop.numberOfItems)")
+                for (i, item) in pop.itemArray.enumerated() {
+                    print("   [\(i)] \(item.title)  enabled=\(item.isEnabled)")
+                }
+                print("  menu.numberOfItems = \(pop.menu?.numberOfItems ?? -1)")
+            }
+            for sub in v.subviews { walk(sub, depth + 1) }
+        }
+        walk(root, 0)
+        print("KeySoundPack.all.count = \(KeySoundPack.all.count)")
+
+        // `numberOfItems` 在弹出之前是 0——SwiftUI 是点开那一刻才建菜单的，
+        // 所以静态查什么都查不到。只能真的把它弹开再截图。
+        // 截图必须在**另一个线程**上发：菜单跟踪自己跑一个 runloop mode，
+        // 主线程上的 asyncAfter 在那期间根本不会 fire。
+        if let target = allPopUps(root).max(by: { $0.frame.width < $1.frame.width }) {
+            // 挪到主屏：`screencapture -R` 的坐标是主屏坐标系，
+            // 窗口开在第二块屏上时截出来的是主屏的桌面（第一次就这么翻车的）。
+            // `--screen2`：摆到第二块屏。怀疑「菜单只剩一行 / popover 弹到左上角」
+            // 是 AppKit 给子窗口算可用区域时落回了**主屏**——窗口在副屏上时，
+            // 按钮的全局坐标在主屏矩形里可能贴边甚至在外面，于是算出来只剩一行。
+            let useSecond = ProcessInfo.processInfo.arguments.contains("--screen2")
+                            && NSScreen.screens.count > 1
+            guard let main = useSecond ? NSScreen.screens[1] : NSScreen.screens.first
+            else { exit(1) }
+            // `--low`：把窗口压到屏幕最底下，看菜单在可用高度不足时是什么样。
+            // 用户报「音色下拉只有一项」，而 12 项菜单要约 280pt——
+            // 弹出方向上放不下时 AppKit 会改成可滚动菜单，空间越小显示的项越少。
+            let lowY = main.visibleFrame.minY
+            let highY = main.visibleFrame.minY + 40
+            let low = ProcessInfo.processInfo.arguments.contains("--low")
+            win.setFrameOrigin(NSPoint(x: main.visibleFrame.minX + 40,
+                                       y: low ? lowY : highY))
+            settle(0.6)
+            let f = win.frame
+            // 截图坐标是**全局主屏坐标系**（原点在主屏左上），不是这块屏的
+            let top = (NSScreen.screens.first ?? main).frame.maxY
+            let rect = "\(Int(f.minX)),\(Int(top - f.maxY)),\(Int(f.width) + 420),\(Int(f.height))"
+            print("弹开最宽的那个（\(Int(target.frame.width))pt），截 \(rect)…")
+            let path = "/private/tmp/claude-501/-Users-xiaosongxiaosong-Documents-MagicKey/"
+                     + "23c17b13-e1d0-4b03-acbd-88d060201b54/scratchpad/picker.png"
+            Thread.detachNewThread {
+                Thread.sleep(forTimeInterval: 1.5)
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+                // 两块屏各存一张：菜单可能根本不在窗口那块屏上，
+                // 只截窗口所在区域就会「什么都没拍到」而误以为菜单没弹出来。
+                p.arguments = ["-x", path, path.replacingOccurrences(of: ".png", with: "_2.png")]
+                try? p.run(); p.waitUntilExit()
+                print("截图 → \(path)")
+                exit(0)
+            }
+            target.performClick(nil)
+        }
+        exit(0)
+    }
+
+    private static func allPopUps(_ v: NSView) -> [NSPopUpButton] {
+        var out: [NSPopUpButton] = []
+        if let p = v as? NSPopUpButton { out.append(p) }
+        for sub in v.subviews { out += allPopUps(sub) }
+        return out
+    }
+
     // MARK: - 跑
 
     static func run() {
         let args = ProcessInfo.processInfo.arguments
         if args.contains("--repro-settings") { reproSettings() }
+        if args.contains("--dump-picker") { dumpPicker() }
+        if args.contains("--repro-fullscreen") { reproFullscreen() }
         if let i = args.firstIndex(of: "--shot-settings"), i + 1 < args.count {
             shootSettings(to: args[i + 1], dark: args.contains("--dark"))
         }
@@ -1405,6 +1703,7 @@ enum UIProbe {
         // ── 7. 面板落点与设置窗口位置 ──────────────────────────────
         // 放在最后：settingsCenterChecks 会把 activationPolicy 切成 .regular，
         // 别让它影响前面那些尺寸测量。
+        failures += keySoundPackInventoryChecks()
         failures += keySoundChecks(settings: settings)
         failures += keySoundRenderChecks()
         failures += keyboardLayoutChecks()
@@ -1415,6 +1714,7 @@ enum UIProbe {
         failures += focusChecks()
         // 这两组会把 activationPolicy 切成 .regular，放在最后，
         // 别让它影响前面那些尺寸测量
+        failures += keyPopoverAnchorChecks(store: CustomSoundStore.shared, settings: settings)
         failures += keyMapWindowChecks(store: CustomSoundStore.shared, settings: settings,
                                        updates: updates)
         failures += settingsCenterChecks(settings: settings, updates: updates)

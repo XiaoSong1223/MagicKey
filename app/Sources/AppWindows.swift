@@ -31,10 +31,59 @@ enum AppWindows {
     static var anyOpen: Bool { !open.isEmpty }
 
     /// 开窗前调。幂等——同一个控制器调两次只算一个。
-    static func willOpen(_ owner: AnyObject) {
+    ///
+    /// 收 `NSWindowController` 而不是 `AnyObject`，是为了**顺手把窗口的
+    /// Space 行为一起设掉**（见 `keepOnPlacedSpace`）：这两个窗口都是从
+    /// 状态栏图标开出来的，摆到哪块屏就该待在哪块屏。
+    static func willOpen(_ owner: NSWindowController) {
         open.insert(ObjectIdentifier(owner))
+        if let window = owner.window { keepOnPlacedSpace(window) }
         NSApp.setActivationPolicy(.regular)
         NSApp.activate()
+        logState(owner)
+    }
+
+    /// 开窗之后回头看一眼真实状态。**三项缺一不可**：
+    ///   - `isKey`：窗口没成为 key 时 AppKit 把每个控件画成非活跃样式
+    ///     （开关掉色、滑块头低对比），看起来像配色问题，别去调颜色；
+    ///   - `onActiveSpace`：窗口开在了另一块 Space 上——用户眼前什么都没有，
+    ///     而窗口本身一切正常，从进程内查什么都是对的。这一项就是为它加的；
+    ///   - `policy`：0 = `.regular`。切晚了 / 切回早了都会让窗口变灰。
+    private static func logState(_ owner: NSWindowController) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak owner] in
+            guard let w = owner?.window else { return }
+            Log.write("[window] \(w.title) isActive=\(NSApp.isActive) "
+                      + "isKey=\(w.isKeyWindow) onActiveSpace=\(w.isOnActiveSpace) "
+                      + "policy=\(NSApp.activationPolicy().rawValue)")
+        }
+    }
+
+    /// 窗口的 Space 行为：**三个标志都不要，保持默认的 `.managed`。**
+    ///
+    /// 摆位由 `centerOnActiveScreen` 决定（鼠标所在那块屏，也就是刚点过状态栏
+    /// 图标的那块）。这里要做的只是**别让系统再把它挪走**。
+    ///
+    /// ## 会跨 Space 的标志都更糟（2026-08-23 真机，VSCode 全屏在外接屏）
+    ///
+    /// - `.fullScreenAuxiliary`：窗口能作为「客人」显示在别人的全屏 Space 上，
+    ///   但**这个标志不传给子窗口**。窗口在眼前、里面全坏：`Picker` 弹出的
+    ///   `NSMenu` 只显示一行，键盘图上点键弹的 `NSPopover` 被钳到屏幕左上角。
+    /// - `.moveToActiveSpace`：更隐蔽。这台机器两块屏各有独立 Space，
+    ///   「active space」是**外接屏上那块全屏 Space**——于是窗口被从鼠标所在的
+    ///   内建屏**拽到外接屏、浮在全屏 VSCode 上**，落进和上一条一模一样的坑。
+    ///   实测截图：内建屏空无一物，外接屏上设置窗口浮在全屏 VSCode 之上。
+    /// - `.canJoinAllSpaces`：让窗口直接出现在全屏 Space，最终落进同一个
+    ///   「父窗口能显示、菜单和 popover 子窗口不能正确显示」的状态。
+    ///
+    /// 这些标志都会造成「窗口看着好好的、子窗口全废」，而子窗口正是这个窗口的主要内容。
+    /// 默认行为下窗口留在被摆到的那块屏的普通 Space 上，菜单和小面板都正常。
+    ///
+    /// 面板锚点那个 2pt 透明窗口是另一回事——它自己就是全部内容、没有子窗口，
+    /// 所以那边该用 `.canJoinAllSpaces + .fullScreenAuxiliary`，两处别互相照抄。
+    static func keepOnPlacedSpace(_ window: NSWindow) {
+        window.collectionBehavior.remove(.moveToActiveSpace)
+        window.collectionBehavior.remove(.fullScreenAuxiliary)
+        window.collectionBehavior.remove(.canJoinAllSpaces)
     }
 
     /// 窗口关闭时调。**全关了才切回 `.accessory`。**
