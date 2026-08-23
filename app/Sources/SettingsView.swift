@@ -122,7 +122,23 @@ struct SettingsView: View {
             }
             .accessibilityLabel("键盘音效音色")
             .accessibilityValue(KeySoundPack.named(settings.keySoundPack).displayName)
-            .help("三套都是真实机械键盘的录音，已做过响度对齐，换音色不会顺带换音量")
+            .help("\(KeySoundPack.all.count) 套都是真实机械键盘的录音，"
+                  + "已做过响度对齐，换音色不会顺带换音量")
+
+            // 指键要一个键一个键地点，需要一张键盘图，这一页的宽度放不下——
+            // 所以是一个按钮加一个独立窗口，不是在这里再展开一段。
+            HStack {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("自定义按键音")
+                    Text("给单个键指定自己的采样，按下时替换掉音色包的声音")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("自定义按键音…") {
+                    KeyMapWindowController.show(store: .shared, settings: settings)
+                }
+                .help("打开键盘图，逐键指定自己导入的采样")
+            }
 
             VStack(alignment: .leading, spacing: 6) {
                 // 开关不在这一页，不说的话用户会在这里找它

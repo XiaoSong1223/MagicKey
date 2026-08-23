@@ -12,8 +12,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private static var shared: SettingsWindowController?
 
-    /// 设置窗口开着没有。面板关闭时要据此决定还不还前台——
-    /// 见 `AppDelegate.popoverDidClose`。
+    /// 设置窗口开着没有。
+    ///
+    /// ⚠️ **不要拿这个去判断「该不该把前台还回去」**——现在还有一个键盘图窗口，
+    /// 那个判断的正确判据是 `AppWindows.anyOpen`（两个窗口的并集）。
     static var isOpen: Bool { shared != nil }
 
     /// 打开设置窗口；已经开着就拿到最前面。
@@ -37,63 +39,26 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         controller.bringToFront()
     }
 
-    /// 摆到目标屏的**正中**。
+    /// 摆到目标屏的正中。
     ///
-    /// 不用 `NSWindow.center()`：它只有水平方向是居中的，垂直方向刻意偏上
-    /// （官方措辞是「somewhat above center」），并排看一眼就知道不是正中间。
+    /// 实现在 `AppWindows.centerOnActiveScreen`——键盘图窗口要走同一套
+    /// （连「先按 fittingSize 定尺寸再居中」那个坑一起），复制第二份必然会漂。
     ///
-    /// 也不用 `setFrameAutosaveName`：那会把上次拖到的位置记进 defaults，
+    /// 不用 `setFrameAutosaveName`：那会把上次拖到的位置记进 defaults，
     /// 下次打开就不在中间了——而这个窗口是关掉即销毁的单例，每次打开都是
     /// 「重新出现」，出现在正中比出现在上次的位置更符合预期。
-    ///
-    /// 目标屏取**指针所在的那块**：用户刚在面板里点完「设置」，指针就停在那儿。
-    /// 和 `AppDelegate.clickedScreen()` 是同一个判据。
     private func centerOnActiveScreen() {
         guard let window else { return }
-
-        let mouse = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
-        guard let visible = screen?.visibleFrame else { window.center(); return }
-
-        // ⚠️ **先把尺寸定下来再居中。** `NSWindow(contentViewController:)` 建出来的
-        // 窗口在 SwiftUI 跑完第一次布局之前是空的（探针实测：那一刻 frame 是 0×32）。
-        // 拿 0×32 去算居中，偏差正好是半个窗口——探针报过 (+240, +210)。
-        // `layoutIfNeeded()` 不够，它不改窗口尺寸，得自己按 fittingSize 设一次。
-        //
-        // 顺带修掉另一件事：AppKit 自己定的窗口高度取的是 `SettingsView` 声明的
-        // **minHeight（420）**，一开窗内容就在滚动；`fittingSize` 给的是
-        // idealHeight（560），才是那个声明本来的意思。
-        if let content = window.contentView {
-            content.layoutSubtreeIfNeeded()
-            var fitting = content.fittingSize
-            if fitting.width > 1, fitting.height > 1 {
-                // 矮屏上别顶满：留 48pt 给窗口投影和上下呼吸
-                fitting.height = min(fitting.height, visible.height - 48)
-                window.setContentSize(fitting)
-            }
-        }
-
-        let size = window.frame.size
-        window.setFrameOrigin(NSPoint(x: (visible.midX - size.width / 2).rounded(),
-                                      y: (visible.midY - size.height / 2).rounded()))
+        AppWindows.centerOnActiveScreen(window)
     }
 
-    /// **必须先切成 `.regular` 再激活。**
-    ///
-    /// `.accessory` 应用无法可靠地自我激活：`NSApp.activate(ignoringOtherApps:)`
-    /// 在 macOS 14+ 已废弃，系统会忽略后台应用的抢焦点请求。实测（探针）：
-    /// 调完之后 `NSApp.isActive == false`、`window.isKeyWindow == false`，
-    /// 而 `canBecomeKey == true`——窗口本身没问题，是**整个应用没被激活**。
-    ///
-    /// 后果不是「窗口在别人后面」这么轻：AppKit 会把非 key 窗口里的每个控件
-    /// 都画成非活跃样式——开关失去强调色变成灰的、滑块头是白圆点贴在浅灰轨道上，
-    /// 在浅色背景里几乎看不见。看起来像配色没调好，其实是激活状态不对。
+    /// **必须先切成 `.regular` 再激活**，理由和「为什么这件事归 `AppWindows` 管」
+    /// 一起写在那边的类型注释里。
     ///
     /// 切 `.regular` 期间会多出一个 Dock 图标和菜单栏，这是菜单栏应用开设置窗口的
-    /// 常规做法，也顺带让 ⌘W / ⌘Q 变得可见。窗口一关就切回去。
+    /// 常规做法，也顺带让 ⌘W / ⌘Q 变得可见。**所有**窗口都关掉之后才切回去。
     private func bringToFront() {
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate()
+        AppWindows.willOpen(self)
         window?.makeKeyAndOrderFront(nil)
 
         // 窗口没成为 key 时 AppKit 会把所有控件画成非活跃样式（开关掉色、
@@ -107,13 +72,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     /// 关掉设置窗口**不退出应用**——`applicationShouldTerminateAfterLastWindowClosed`
-    /// 已经返回 false。这里把激活策略切回纯菜单栏，并放掉单例。
+    /// 已经返回 false。这里放掉单例，激活策略交给 `AppWindows`：
+    /// 键盘图窗口还开着时**不能**切回 `.accessory`，那会把它当场画灰。
     func windowWillClose(_ notification: Notification) {
         Self.shared = nil
-        // 放到下一个 runloop：窗口还在关闭流程里，此刻改策略会让 AppKit
-        // 在半途重排菜单栏和 Dock。
-        DispatchQueue.main.async {
-            NSApp.setActivationPolicy(.accessory)
-        }
+        AppWindows.didClose(self)
     }
 }

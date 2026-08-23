@@ -27,6 +27,11 @@ final class KeySoundPlayer {
 
     private var pack: LoadedKeySoundPack?
 
+    /// 自定义按键音层。**nil = 整层旁路**（用户关了总开关，或一个键都没指）。
+    /// 用「有没有这个对象」表示开关，而不是再加一个 bool：关掉时连内存也不占，
+    /// 而且解析路径上少一个分支就少一处能写错的地方。
+    private var custom: LoadedCustomSounds?
+
     /// 上一次用过的候选下标，按「槽位 + 方向」分别记。
     /// 随机取样必须**避开上一个**：真随机在 5 选 1 里有 20% 的概率连着重复，
     /// 而连着两下一模一样正是「机关枪」最刺耳的那一下。
@@ -95,6 +100,15 @@ final class KeySoundPlayer {
         pack = loaded
     }
 
+    /// 换掉自定义层。传 nil 就是整层旁路。
+    ///
+    /// **每次都换，不做 id 比对**——这个方法的调用者是「库或指键变了」，
+    /// 变化本身就是重载的理由。重复解码的代价由 `LoadedCustomSounds(previous:)`
+    /// 的缓存兜住，不需要在这里再判一次。
+    func setCustom(_ layer: LoadedCustomSounds?) {
+        custom = layer
+    }
+
     /// 0–1。走 mainMixer 的总音量，不逐个节点设——逐个设的话
     /// 拖滑块时已经在响的那几路会跟着跳变，听起来像杂音。
     func setVolume(_ v: Double) {
@@ -139,20 +153,44 @@ final class KeySoundPlayer {
 
     // MARK: - 播放
 
+    /// 这一下该播哪一组候选。
+    ///
+    /// **优先级：按下 = 自定义指键 > 音色包槽位；抬起 = 永远走音色包。**
+    ///
+    /// 抬起不走自定义是定下来的取舍，不是没做完：用户导入的多半是一整声
+    /// 「哒」，把它同时当按下音和抬起音，一次敲击就会听到两遍同样的声音。
+    /// 让抬起继续用音色包的抬起音，两段音的手感反而是连着的。
+    ///
+    /// 抽成单独一个函数是为了让探针能验这条优先级——`play` 里内联的话，
+    /// 探针只能靠听，而「解析到了哪一层」听不出来。
+    private func candidates(_ slot: KeySoundSlot, isDown: Bool,
+                            keyCode: UInt16) -> (buffers: [AVAudioPCMBuffer], fromCustom: Bool) {
+        if isDown, let mine = custom?.buffers(for: keyCode) {
+            return (mine, true)
+        }
+        return (pack?.buffers(slot, isDown: isDown) ?? [], false)
+    }
+
+    /// - Parameter keyCode: 事件里的虚拟键码。自定义指键按它查表——
+    ///   槽位（空格/回车/退格/通用）粒度太粗，指不到具体某个键。
     /// - Parameter arrival: 事件到达的时刻。用来量「事件到达 → scheduleBuffer」
     ///   这一段，也就是本进程真正能控制的那部分延迟。
-    func play(_ slot: KeySoundSlot, isDown: Bool, arrival: CFAbsoluteTime) {
-        guard let pack else { return }
+    func play(_ slot: KeySoundSlot, isDown: Bool, keyCode: UInt16, arrival: CFAbsoluteTime) {
+        guard pack != nil else { return }
 
         // 空闲收掉之后的第一次敲击：在这里把引擎拉回来。这一下会比后续的慢
         // 几毫秒，`start()` 里那行日志就是给这一下看的。
         if !engine.isRunning { start() }
         guard engine.isRunning else { return }
 
-        let candidates = pack.buffers(slot, isDown: isDown)
+        let (candidates, fromCustom) = candidates(slot, isDown: isDown, keyCode: keyCode)
         guard !candidates.isEmpty else { return }
 
-        let key = slot.hashValue &* 2 &+ (isDown ? 1 : 0)
+        // 「上一次挑了哪个」要按**候选来源**分开记。自定义键和音色包槽位共用
+        // 一个计数器的话，两边的下标会互相顶掉，避免重复那件事就白做了。
+        let key = fromCustom
+            ? Int(keyCode) &+ 1_000_000
+            : slot.hashValue &* 2 &+ (isDown ? 1 : 0)
         var index = Int.random(in: 0..<candidates.count)
         if candidates.count > 1, index == lastPicked[key] {
             index = (index + 1) % candidates.count
@@ -239,5 +277,17 @@ final class KeySoundPlayer {
     var probeEngine: AVAudioEngine { engine }
     /// 模拟「空闲 30 秒」那一下，不用真等 30 秒
     func probeForceIdlePause() { idleTimeoutFired() }
+
+    /// 一次敲击解析到了哪一层。**走的就是 `play` 用的那个函数**——
+    /// 探针复刻一份优先级判断的话，测的是探针自己写对没有，不是 app 写对没有。
+    enum Resolution: String { case custom = "自定义", pack = "音色包", none = "无" }
+
+    func probeResolve(_ slot: KeySoundSlot, isDown: Bool, keyCode: UInt16) -> Resolution {
+        let (buffers, fromCustom) = candidates(slot, isDown: isDown, keyCode: keyCode)
+        if buffers.isEmpty { return .none }
+        return fromCustom ? .custom : .pack
+    }
+
+    var probeCustomIsLoaded: Bool { custom != nil }
     #endif
 }

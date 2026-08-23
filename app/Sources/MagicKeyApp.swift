@@ -84,6 +84,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
                 DispatchQueue.main.async { self?.syncFromSettings() }
             }
         )
+
+        // 音色库或指键一变就把自定义层重建一遍，否则用户在键盘图上点完，
+        // 得关掉音效开关再打开才生效。只推给 keySound，不走 syncFromSettings——
+        // 背光引擎和这件事毫无关系，没必要陪着收敛一次。
+        cancellables.append(
+            CustomSoundStore.shared.objectWillChange.sink { [weak self] _ in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.keySound.apply(self.settings)
+                }
+            }
+        )
         syncFromSettings()
     }
 
@@ -271,10 +283,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
         // 见 `PanelAnchor.AnchorPanel`），不还的话：用户上一个 app 的标题栏一直是灰的，
         // 而本应用作为 `.accessory` 又没有任何窗口收键盘——敲字掉进黑洞。
         //
-        // 设置窗口开着时**不能还**：那正好会把它变成非 key，控件全画灰，
-        // 也就是 `SettingsWindowController.bringToFront` 花了力气避开的那件事。
+        // 设置窗口或键盘图窗口开着时**不能还**：那正好会把它变成非 key，
+        // 控件全画灰，也就是 `AppWindows` 花了力气避开的那件事。
+        // 判据必须是**两个窗口的并集**（`AppWindows.anyOpen`），
+        // 只看设置窗口的话，从设置里点开键盘图、再关掉设置，那个键盘图就灰了。
         DispatchQueue.main.async {
-            guard !SettingsWindowController.isOpen else { return }
+            guard !AppWindows.anyOpen else { return }
             NSApp.deactivate()
         }
     }

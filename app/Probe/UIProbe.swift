@@ -666,7 +666,9 @@ enum UIProbe {
         func measure(_ tag: String, hit: Bool, expectSound: Bool, _ prep: () -> Void) {
             prep()
             _ = meter.readAndReset()
-            if hit { player.play(.generic, isDown: true, arrival: CFAbsoluteTimeGetCurrent()) }
+            // keyCode 12 = kVK_ANSI_Q，没有任何自定义指键，所以走音色包
+            if hit { player.play(.generic, isDown: true, keyCode: 12,
+                                 arrival: CFAbsoluteTimeGetCurrent()) }
             settle(0.4)
             let rms = meter.readAndReset()
             let sounded = rms > 1e-6
@@ -685,6 +687,505 @@ enum UIProbe {
         measure("③ 空闲暂停后恢复播  ", hit: true, expectSound: true) { player.probeForceIdlePause() }
         // ④ 阴性对照：不敲键必须量到 0——证明探头不是永远报「有声」
         measure("④ 不敲键（阴性对照）", hit: false, expectSound: false) { }
+
+        return failures
+    }
+
+    // MARK: - 自定义按键音
+
+    /// 键位表的健全性：**键码不重复、矩形不重叠、全部落在画布内。**
+    ///
+    /// 这三条都是「写错了界面照样画得出来」的错：键码抄错一个，那个键指的音
+    /// 会跑到另一个键上（甚至指到一个根本不在图上的键）；宽度写错 0.25，
+    /// 整排键往右挪，肉眼看着还是一张键盘。人工检查得对着头文件数 77 个数。
+    ///
+    /// 「相邻允许贴边」是这一组的关键放宽：布局表里的键**就是**首尾相接的
+    /// （x 靠宽度累加），键与键之间那道缝是画的时候减 2pt 留出来的，不在表里。
+    /// 判据用面积严格大于 0，贴边（面积 == 0）放行。
+    static func keyboardLayoutChecks() -> [String] {
+        print("\n── 键位表健全性 ──")
+        var failures: [String] = []
+        let keys = KeyboardLayout.keys
+        let eps = 1e-6
+
+        // ① 键码不重复。重复的话两个键帽指向同一条指键记录，
+        // 点了 A 却看到 B 也亮起来
+        var seen: [UInt16: String] = [:]
+        for k in keys {
+            if let prev = seen[k.keyCode] {
+                failures.append("键位表键码重复：\(k.keyCode) 同时是「\(prev)」和「\(k.name)」")
+            }
+            seen[k.keyCode] = k.name
+        }
+
+        // ② 全部落在画布内
+        var outside = 0
+        for k in keys where k.x < -eps || k.y < -eps
+            || k.x + k.w > KeyboardLayout.unitsWide + eps
+            || k.y + k.h > KeyboardLayout.unitsHigh + eps {
+            failures.append(String(format: "「%@」超出画布：x=%.3f y=%.3f w=%.3f h=%.3f",
+                                   k.name, k.x, k.y, k.w, k.h))
+            outside += 1
+        }
+
+        // ③ 两两不重叠
+        var overlaps = 0
+        for i in 0..<keys.count {
+            for j in (i + 1)..<keys.count {
+                let a = keys[i], b = keys[j]
+                let dx = min(a.x + a.w, b.x + b.w) - max(a.x, b.x)
+                let dy = min(a.y + a.h, b.y + b.h) - max(a.y, b.y)
+                guard dx > eps, dy > eps else { continue }   // 贴边 / 不相交
+                failures.append(String(format: "「%@」和「%@」重叠 %.3f×%.3f 单位",
+                                       a.name, b.name, dx, dy))
+                overlaps += 1
+            }
+        }
+
+        // ④ 键帽总面积。这一条抓的是上面三条抓不到的错：把某个键的宽度写窄
+        // （比如回车 2.25 打成 2.0），既不会重叠也不会越界，整行只是往左缩，
+        // 肉眼看还是一张键盘。
+        //
+        // **不按行查宽度**：方向键那一簇是半高的倒 T，按 y 分组会把底排
+        // 劈成 y=4.75（含 ↑）和 y=5.25 两段，两段各自都不等于 15——
+        // 于是正确的布局会被报成可疑。这种「对着正确数据喊狼来了」的检查
+        // 用两次就没人看了。面积是一个精确、不用分情况的不变量。
+        //
+        // 画布 15×5.75 = 86.25，键帽合计 85.25，差出来的 1.0 正是
+        // ← 和 → 上方那两个半格空位（2 × 1 × 0.5）——MacBook 上就是空的。
+        let covered = keys.reduce(0.0) { $0 + $1.w * $1.h }
+        let canvas = KeyboardLayout.unitsWide * KeyboardLayout.unitsHigh
+        let expectedBlank = 1.0
+        let areaOK = abs(canvas - covered - expectedBlank) < 1e-9
+        print(String(format: "  画布 %.2f 单位²，键帽合计 %.2f，空位 %.2f（应为 %.2f：←/→ 上方两个半格）%@",
+                     canvas, covered, canvas - covered, expectedBlank, areaOK ? " ✅" : " ❌"))
+        if !areaOK {
+            failures.append(String(format: "键位表面积对不上：画布 %.2f − 键帽 %.2f = %.2f，应为 %.2f"
+                                   + "（多半是某个键的宽或高写错了）",
+                                   canvas, covered, canvas - covered, expectedBlank))
+        }
+
+        // 每一行的键数与宽度，只作诊断输出——真正的判据是上面那四条
+        let rows = Dictionary(grouping: keys, by: { $0.y }).sorted { $0.key < $1.key }
+        for (y, row) in rows {
+            print(String(format: "  y=%.2f  %2d 键  合计宽 %.3f 单位",
+                         y, row.count, row.reduce(0.0) { $0 + $1.w }))
+        }
+        print("  共 \(keys.count) 个键，键码 \(seen.count) 个不重复，"
+              + "越界 \(outside) 个，重叠 \(overlaps) 对 "
+              + (failures.isEmpty ? "✅" : "❌"))
+        return failures
+    }
+
+    /// 在临时目录里合成一条 wav。
+    ///
+    /// **不带二进制夹具进仓库。** 探针要的是「一条能读的音频」和「一条超长的音频」，
+    /// 两者都能现场算出来；夹具文件会在 review 里变成一坨看不懂的二进制，
+    /// 而且时长一改就得重新生成。
+    ///
+    /// 用带衰减包络的正弦而不是等幅正弦：等幅的 RMS 顶到 −9dBFS，
+    /// 对齐系数会被峰值一路压到底，测不出「gain 正常算出来」那一支。
+    /// - Parameter amplitude: 峰值幅度。要能造出**比对齐目标响**和**比目标轻**
+    ///   两种采样——响度对齐是双向的，只测一边就漏掉了另一边（早先
+    ///   `alignmentGain` 里那个 `max(1, …)` 把衰减那一支堵死了，
+    ///   只用一条采样测的话它会一路报绿）。
+    ///
+    /// ⚠️ 写句柄必须在本函数内析构：`AVAudioFile` 是在**析构时**收尾文件头的，
+    /// 还活着的时候读回来会报「读不出音频」。
+    private static func writeSynthWav(to url: URL, seconds: Double,
+                                      amplitude: Double = 0.35) -> Bool {
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1),
+              let file = try? AVAudioFile(forWriting: url, settings: format.settings),
+              let buf = AVAudioPCMBuffer(pcmFormat: format,
+                                         frameCapacity: AVAudioFrameCount(seconds * 44_100)),
+              let ch = buf.floatChannelData else { return false }
+        buf.frameLength = buf.frameCapacity
+        for i in 0..<Int(buf.frameLength) {
+            let t = Double(i) / 44_100
+            ch[0][i] = Float(sin(2 * .pi * 440 * t) * amplitude * exp(-t * 2.0))
+        }
+        return (try? file.write(from: buf)) != nil
+    }
+
+    /// 导入往返：**合法文件进得来、超长文件进不来、删了音色指键跟着没。**
+    ///
+    /// ⚠️ 全程在临时目录里做（`CustomSoundStore.probeDirectoryOverride`）。
+    /// 不隔离的话这一组会往用户真正的
+    /// `~/Library/Application Support/MagicKey/CustomSounds/` 里塞测试文件，
+    /// 甚至在「删除」那一步删掉用户自己导入的音色。同一个理由让 `Settings`
+    /// 也在探针里换了 defaults 域——那个坑是实测踩出来的，不要再踩一次。
+    static func customImportChecks(store: CustomSoundStore) -> [String] {
+        print("\n── 自定义按键音：导入往返 ──")
+        var failures: [String] = []
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("magickey-probe-src-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let quietURL = tmp.appendingPathComponent("探针轻音.wav")
+        let loudURL = tmp.appendingPathComponent("探针响音.wav")
+        let edgeURL = tmp.appendingPathComponent("探针临界音.wav")
+        let longURL = tmp.appendingPathComponent("探针超长音.wav")
+        guard writeSynthWav(to: quietURL, seconds: 0.30, amplitude: 0.02),
+              writeSynthWav(to: loudURL, seconds: 0.30, amplitude: 0.60),
+              writeSynthWav(to: edgeURL, seconds: 1.90),
+              writeSynthWav(to: longURL, seconds: 2.50) else {
+            return ["合成测试 wav 失败，这一组没跑成"]
+        }
+
+        /// 导入一条并验响度对齐。
+        ///
+        /// 判据是**对齐后的 RMS 落在目标上**，不是「gain 大于几」——
+        /// 后者把「只放大」这条内置包才有的性质当成了通则，
+        /// 于是一条比目标响的采样不被压下去也能报绿（早先就是这么漏的）。
+        /// 被峰值余量顶住时对齐不到位是正常的，那一支单独放行。
+        func importAndCheck(_ tag: String, _ url: URL) -> CustomSoundEntry? {
+            let target = KeySoundPack.loudnessTargetDBFS
+            let ceiling = KeySoundPack.peakCeiling
+            do {
+                let entry = try store.importSound(from: url)
+                guard let decoded = LoadedKeySoundPack.decode(store.url(for: entry)) else {
+                    failures.append("\(tag)：导入后的文件读不回来")
+                    return entry
+                }
+                let level = CustomSoundStore.analyze(decoded)
+                let headroom = level.peak * entry.gain
+                let alignedRMS = level.rmsDBFS + 20 * log10(entry.gain)
+                let peakLimited = abs(headroom - ceiling) < 1e-3
+                let aligned = abs(alignedRMS - target) < 0.05
+                // 削顶是硬判据；对齐不到位只在「被峰值顶住」时才放行
+                let ok = headroom <= 1.0 && (aligned || peakLimited)
+                print(String(format: "  %@ %.1fdBFS → gain %.2f → %.1fdBFS（目标 %.1f）"
+                             + " 峰值×gain=%.3f%@  %@",
+                             tag, level.rmsDBFS, entry.gain, alignedRMS, target, headroom,
+                             peakLimited ? "（峰值顶住）" : "", ok ? "✅" : "❌"))
+                if headroom > 1.0 {
+                    failures.append(String(format: "%@：会削顶，峰值×gain=%.3f", tag, headroom))
+                }
+                if !aligned && !peakLimited {
+                    failures.append(String(format: "%@：对齐后 %.2fdBFS，偏离目标 %.2fdB"
+                                           + "（响度对齐是双向的，比目标响也要压下去）",
+                                           tag, alignedRMS, alignedRMS - target))
+                }
+                return entry
+            } catch {
+                failures.append("\(tag)：\(error.localizedDescription)")
+                print("  \(tag) ❌ \(error.localizedDescription)")
+                return nil
+            }
+        }
+
+        // ①a 比目标**轻**的采样：要被放大上来
+        let imported = importAndCheck("①a 轻音 0.30s 需放大", quietURL)
+        // ①b 比目标**响**的采样：要被压下去。这一条是 `max(1, …)` 那个 bug 的判据
+        if let loud = importAndCheck("①b 响音 0.30s 需衰减", loudURL) {
+            if loud.gain >= 1.0 {
+                failures.append(String(format: "比目标响的采样没有被衰减（gain=%.2f）", loud.gain))
+            }
+            store.remove(loud.id)
+        }
+
+        // ② 阴性对照：1.90s **必须收**。
+        // 少了这一条，「上限一律拒收」也能让 ③ 报绿——一个查不到东西的检查
+        // 报通过，比没有这个检查更糟。
+        do {
+            let entry = try store.importSound(from: edgeURL)
+            print("  ② 导入 1.90s（阴性对照）收下了  ✅")
+            store.remove(entry.id)
+        } catch {
+            failures.append("1.90s 的采样被拒了，上限判据可能写成了「一律拒收」：\(error.localizedDescription)")
+            print("  ② 导入 1.90s（阴性对照）❌ \(error.localizedDescription)")
+        }
+
+        // ③ 超长：拒收，而且提示里要带**实际时长**
+        let before = store.entries.count
+        do {
+            _ = try store.importSound(from: longURL)
+            failures.append("2.50s 的采样被收下了，时长上限没起作用")
+            print("  ③ 导入 2.50s      ❌ 居然收下了")
+        } catch {
+            let why = error.localizedDescription
+            let mentionsDuration = why.contains("2.5")
+            print("  ③ 导入 2.50s      拒收：\(why)  \(mentionsDuration ? "✅" : "❌ 没说实际时长")")
+            if !mentionsDuration {
+                failures.append("超长拒收的提示里没有实际时长，用户不知道要剪到多短")
+            }
+            if store.entries.count != before {
+                failures.append("超长文件被拒了，音色库里却多了一条")
+            }
+        }
+
+        // ④ 删除音色 → 引用它的指键必须一起消失
+        if let entry = imported {
+            let keys: [UInt16] = [49, 36, 51]        // 空格 / 回车 / 退格
+            for code in keys { store.assign(entry.id, to: code) }
+            let assignedBefore = store.assignments.count
+            let fileExisted = FileManager.default.fileExists(atPath: store.url(for: entry).path)
+            store.remove(entry.id)
+            let leftover = keys.filter { store.assignments[$0] != nil }
+            let fileGone = !FileManager.default.fileExists(atPath: store.url(for: entry).path)
+            let ok = leftover.isEmpty && fileGone
+            print("  ④ 删除音色        指键 \(assignedBefore) → \(store.assignments.count)，"
+                  + "文件\(fileExisted ? (fileGone ? "已删" : "还在") : "本来就没有")  \(ok ? "✅" : "❌")")
+            if !leftover.isEmpty {
+                failures.append("删掉音色后还留着 \(leftover.count) 个指键，那些键会按下无声")
+            }
+            if !fileGone { failures.append("删掉音色后文件还在磁盘上") }
+        }
+        return failures
+    }
+
+    /// 解析优先级：**按下走自定义，抬起走音色包，总开关关掉整层旁路。**
+    ///
+    /// 这一组测的是听不出来的东西。「有声」证明不了「声是从哪一层来的」，
+    /// 所以判据落在 `probeResolve` 上——它调的就是 `play` 用的那个函数，
+    /// 探针不复刻一份优先级判断（复刻的话测的是探针自己写对没有）。
+    static func customResolutionChecks(store: CustomSoundStore,
+                                       settings: Settings) -> [String] {
+        print("\n── 自定义按键音：解析优先级 ──")
+        var failures: [String] = []
+
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("magickey-probe-res-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let src = tmp.appendingPathComponent("探针指键音.wav")
+        guard writeSynthWav(to: src, seconds: 0.40) else { return ["合成测试 wav 失败"] }
+
+        guard let entry = try? store.importSound(from: src) else {
+            return ["解析优先级这一组：测试采样导不进去"]
+        }
+        defer { store.remove(entry.id) }
+        let space: UInt16 = 49          // kVK_Space
+        let q: UInt16 = 12              // kVK_ANSI_Q
+        store.assign(entry.id, to: space)
+
+        let player = KeySoundPlayer()
+        player.load(KeySoundPack.named(KeySoundPack.fallback.id))
+        player.setVolume(0)
+        defer { player.stop() }
+        player.setCustom(LoadedCustomSounds(entries: store.entries,
+                                            assignments: store.assignments,
+                                            directory: store.directory,
+                                            format: KeySoundPlayer.format))
+
+        func expect(_ tag: String, _ got: KeySoundPlayer.Resolution,
+                    _ want: KeySoundPlayer.Resolution) {
+            let ok = got == want
+            print("  \(tag) → \(got.rawValue)  \(ok ? "✅" : "❌ 期望 \(want.rawValue)")")
+            if !ok { failures.append("解析优先级「\(tag)」解析到了 \(got.rawValue)，期望 \(want.rawValue)") }
+        }
+
+        expect("① 空格 按下（已指键）  ", player.probeResolve(.space, isDown: true, keyCode: space), .custom)
+        // ② 抬起永远走音色包。写反的话一次敲击会听到两遍同一条采样
+        expect("② 空格 抬起（已指键）  ", player.probeResolve(.space, isDown: false, keyCode: space), .pack)
+        // ③ 阴性对照：没指键的键必须还是音色包
+        expect("③ Q 按下（未指键）     ", player.probeResolve(.generic, isDown: true, keyCode: q), .pack)
+
+        // ④ 整层旁路。判据落在 **controller** 上：这是收敛逻辑，
+        // 直接 setCustom(nil) 测的是播放层，测不到「设置有没有被读进来」。
+        let controller = KeySoundController(customStore: store)
+        let savedEnabled = settings.keySoundEnabled
+        let savedCustom = settings.keySoundCustomEnabled
+        defer {
+            settings.keySoundEnabled = savedEnabled
+            settings.keySoundCustomEnabled = savedCustom
+            KeySoundController.probeAccessOverride = nil
+            KeySoundController.setProbeLaunchAccess(nil)
+            controller.apply(settings)
+        }
+        KeySoundController.setProbeLaunchAccess(true)
+        KeySoundController.probeAccessOverride = true
+        settings.keySoundEnabled = true
+
+        settings.keySoundCustomEnabled = true
+        controller.apply(settings)
+        settle(0.3)
+        let onLoaded = controller.probeCustomIsLoaded
+        settings.keySoundCustomEnabled = false
+        controller.apply(settings)
+        settle(0.3)
+        let offLoaded = controller.probeCustomIsLoaded
+        let offResolves = controller.probePlayer.probeResolve(.space, isDown: true, keyCode: space)
+
+        print("  ④ 总开关 开→关         自定义层 \(onLoaded ? "已装" : "未装")"
+              + " → \(offLoaded ? "已装" : "未装")，关掉后空格解析到 \(offResolves.rawValue)"
+              + "  \(onLoaded && !offLoaded && offResolves == .pack ? "✅" : "❌")")
+        if !onLoaded { failures.append("总开关打开时自定义层没装上") }
+        if offLoaded { failures.append("总开关关掉后自定义层还在（没有旁路）") }
+        if offResolves != .pack { failures.append("总开关关掉后没有回落到音色包") }
+
+        return failures
+    }
+
+    /// 自定义采样**真的从播放路径渲染出声了吗**。
+    ///
+    /// 判据不能只是「有声」——音色包也有声。这里用**时长**当判别器：
+    /// 自定义采样合成成 1.5 秒，而音色包的采样只有 0.10–0.24 秒。
+    /// 敲下去等 0.7 秒之后再开始量，那时音色包早就静了，
+    /// 还在响的只可能是自定义那一条。阴性对照就是同样时刻去量一个没指键的键。
+    static func customRenderChecks(store: CustomSoundStore) -> [String] {
+        print("\n── 自定义按键音：渲染回归（静默，tap 在混音前）──")
+        var failures: [String] = []
+
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("magickey-probe-render-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let src = tmp.appendingPathComponent("探针长音.wav")
+        // 1.5s：比音色包最长的采样（0.24s）长一个数量级，
+        // ±3% 音高变体最短也有 1.46s，量窗（0.7–1.1s）稳稳落在里面
+        guard writeSynthWav(to: src, seconds: 1.5) else { return ["合成测试 wav 失败"] }
+        guard let entry = try? store.importSound(from: src) else {
+            return ["渲染回归这一组：测试采样导不进去"]
+        }
+        defer { store.remove(entry.id) }
+        let space: UInt16 = 49
+        store.assign(entry.id, to: space)
+
+        final class Meter: @unchecked Sendable {
+            private var sum = 0.0
+            private var n = 0
+            private let lock = NSLock()
+            func add(_ buf: AVAudioPCMBuffer) {
+                guard let ch = buf.floatChannelData else { return }
+                var s = 0.0
+                for i in 0..<Int(buf.frameLength) { let v = Double(ch[0][i]); s += v * v }
+                lock.lock(); sum += s; n += Int(buf.frameLength); lock.unlock()
+            }
+            func readAndReset() -> Double {
+                lock.lock(); defer { lock.unlock() }
+                let rms = n > 0 ? (sum / Double(n)).squareRoot() : 0
+                sum = 0; n = 0
+                return rms
+            }
+        }
+
+        let player = KeySoundPlayer()
+        player.load(KeySoundPack.named(KeySoundPack.fallback.id))
+        player.setVolume(0)          // 回归测试不许出声
+        player.setCustom(LoadedCustomSounds(entries: store.entries,
+                                            assignments: store.assignments,
+                                            directory: store.directory,
+                                            format: KeySoundPlayer.format))
+        player.start()
+        defer { player.stop() }
+
+        let meter = Meter()
+        for node in player.probeEngine.attachedNodes.compactMap({ $0 as? AVAudioPlayerNode }) {
+            node.installTap(onBus: 0, bufferSize: 1024, format: nil) { buf, _ in meter.add(buf) }
+        }
+
+        func measure(_ tag: String, keyCode: UInt16, expectSound: Bool) {
+            _ = meter.readAndReset()
+            player.play(KeySoundSlot(keyCode: keyCode), isDown: true,
+                        keyCode: keyCode, arrival: CFAbsoluteTimeGetCurrent())
+            settle(0.7)                     // 音色包的采样到这时早就静了
+            _ = meter.readAndReset()
+            settle(0.4)                     // 量窗 0.7–1.1s
+            let rms = meter.readAndReset()
+            let sounded = rms > 1e-6
+            let ok = sounded == expectSound
+            print(String(format: "  %@ 0.7–1.1s 窗内 rms=%.6f → %@  %@",
+                         tag, rms, sounded ? "仍在响" : "已静", ok ? "✅" : "❌"))
+            if !ok {
+                failures.append("自定义渲染「\(tag)」：期望\(expectSound ? "仍在响" : "已静")，"
+                                + String(format: "实测 rms=%.6f", rms))
+            }
+        }
+
+        // ① 指了 1.5s 采样的空格：0.7 秒之后还在响
+        measure("① 空格（已指 1.5s 采样）", keyCode: space, expectSound: true)
+        // ② 阴性对照：没指键的 Q 走音色包，同一时刻必须已经静了。
+        // 这一条要是也报「仍在响」，说明判别器根本没在判别
+        measure("② Q（未指键，走音色包） ", keyCode: 12, expectSound: false)
+
+        return failures
+    }
+
+    /// 键盘图窗口：**开得出来、落在屏幕里，而且两个窗口的前台策略取并集。**
+    ///
+    /// 并集那一条是本次改动最容易翻车的地方：关掉设置窗口时若直接切回
+    /// `.accessory`，还开着的键盘图窗口会当场被 AppKit 画成非活跃样式
+    /// （开关掉色、滑块头几乎看不见）。这个症状看起来完全像配色问题，
+    /// 人工点击时也只有「先开设置、再开键盘图、再关设置」这一个顺序能复现。
+    ///
+    /// 阴性对照在第 ④ 步：两个都关掉之后**必须**切回 `.accessory`——
+    /// 否则「永远停在 .regular」也能让 ③ 报绿。
+    static func keyMapWindowChecks(store: CustomSoundStore, settings: Settings,
+                                   updates: UpdateChecker) -> [String] {
+        print("\n── 自定义按键音窗口 + 两窗口前台策略 ──")
+        var failures: [String] = []
+
+        func policy() -> String {
+            switch NSApp.activationPolicy() {
+            case .regular: return "regular"
+            case .accessory: return "accessory"
+            default: return "其他"
+            }
+        }
+        func keyMapWindow() -> NSWindow? {
+            NSApp.windows.first { $0.title == "自定义按键音" }
+        }
+
+        // ① 开出来，量尺寸
+        KeyMapWindowController.show(store: store, settings: settings)
+        settle(0.9)
+        guard let win = keyMapWindow() else {
+            return ["键盘图窗口没开出来"]
+        }
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
+        if let visible = screen?.visibleFrame {
+            let f = win.frame
+            // 窗口投影会超出 frame 一点，所以留 2pt 容差
+            let inside = f.minX >= visible.minX - 2 && f.maxX <= visible.maxX + 2
+                      && f.minY >= visible.minY - 2 && f.maxY <= visible.maxY + 2
+            print(String(format: "  ① 窗口 %.0f×%.0f 于 (%.0f, %.0f)；可用区 %.0f×%.0f  %@",
+                         f.width, f.height, f.minX, f.minY,
+                         visible.width, visible.height, inside ? "✅ 在屏内" : "❌ 超出屏幕"))
+            if !inside {
+                failures.append(String(format: "键盘图窗口没落在屏幕里：%.0f×%.0f @ (%.0f, %.0f)",
+                                       f.width, f.height, f.minX, f.minY))
+            }
+        }
+
+        // ② 再开一次必须是同一个窗口（单例），不能叠出第二个
+        KeyMapWindowController.show(store: store, settings: settings)
+        settle(0.5)
+        let count = NSApp.windows.filter { $0.title == "自定义按键音" }.count
+        print("  ② 重复打开 → \(count) 个窗口  \(count == 1 ? "✅" : "❌ 叠出来了")")
+        if count != 1 { failures.append("键盘图窗口不是单例，重复点开叠出了 \(count) 个") }
+
+        // ③ 两个窗口都开着，关掉设置窗口 —— **策略必须还停在 regular**
+        SettingsWindowController.show(settings: settings, updates: updates)
+        settle(0.8)
+        let bothOpen = "\(policy())/anyOpen=\(AppWindows.anyOpen)"
+        NSApp.windows.first { $0.title == "MagicKey 设置" }?.performClose(nil)
+        settle(0.8)
+        let afterSettingsClosed = policy()
+        let stillOpen = AppWindows.anyOpen
+        print("  ③ 两窗都开(\(bothOpen)) → 关掉设置 → \(afterSettingsClosed)"
+              + "/anyOpen=\(stillOpen)  "
+              + (afterSettingsClosed == "regular" && stillOpen ? "✅" : "❌ 键盘图会被画灰"))
+        if afterSettingsClosed != "regular" {
+            failures.append("关掉设置窗口后切回了 \(afterSettingsClosed)，"
+                            + "还开着的键盘图窗口会被画成非活跃样式")
+        }
+        if !stillOpen { failures.append("键盘图还开着，AppWindows.anyOpen 却报 false") }
+
+        // ④ 阴性对照：全关掉之后必须切回 accessory
+        win.performClose(nil)
+        settle(0.9)
+        let afterAllClosed = policy()
+        let noneOpen = !AppWindows.anyOpen
+        print("  ④ 再关掉键盘图 → \(afterAllClosed)/anyOpen=\(AppWindows.anyOpen)  "
+              + (afterAllClosed == "accessory" && noneOpen ? "✅" : "❌"))
+        if afterAllClosed != "accessory" {
+            failures.append("窗口全关掉了却没切回 .accessory（Dock 图标会一直挂着），"
+                            + "而且这说明 ③ 的绿灯是「永远停在 regular」蒙的")
+        }
+        if !noneOpen { failures.append("窗口全关掉了，AppWindows.anyOpen 却还报 true") }
 
         return failures
     }
@@ -906,8 +1407,16 @@ enum UIProbe {
         // 别让它影响前面那些尺寸测量。
         failures += keySoundChecks(settings: settings)
         failures += keySoundRenderChecks()
+        failures += keyboardLayoutChecks()
+        failures += customImportChecks(store: CustomSoundStore.shared)
+        failures += customResolutionChecks(store: CustomSoundStore.shared, settings: settings)
+        failures += customRenderChecks(store: CustomSoundStore.shared)
         failures += anchorChecks()
         failures += focusChecks()
+        // 这两组会把 activationPolicy 切成 .regular，放在最后，
+        // 别让它影响前面那些尺寸测量
+        failures += keyMapWindowChecks(store: CustomSoundStore.shared, settings: settings,
+                                       updates: updates)
         failures += settingsCenterChecks(settings: settings, updates: updates)
 
         // ── 汇总 ───────────────────────────────────────────────────
@@ -935,6 +1444,18 @@ enum ProbeMain {
     static func main() {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
+
+        // ⚠️ **必须在碰到任何 `CustomSoundStore.shared` 之前设。**
+        // `shared` 是惰性全局，解析过一次就再也不会重新解析目录了，
+        // 而 `UIProbe.run()` 里第一行造的 `KeySoundController` 就会碰它。
+        // 不挪走的话，探针会往用户真正的 App Support 目录里写测试采样，
+        // 「删除音色」那一步还会删掉用户自己导入的东西。
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent("magickey-uiprobe-sounds", isDirectory: true)
+        try? FileManager.default.removeItem(at: sandbox)   // 每次从干净状态开始
+        try? FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        CustomSoundStore.probeDirectoryOverride = sandbox
+
         MainActor.assumeIsolated {
             Log.sink = { _ in }          // 探针不要引擎日志刷屏
             UIProbe.run()

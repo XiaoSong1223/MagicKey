@@ -171,8 +171,12 @@ final class Settings: ObservableObject {
         didSet { Self.d.set(keySoundEnabled, forKey: "keySoundEnabled") }
     }
 
-    /// 键盘音效的总音量 0–1。默认 0.6：三套包已经做过响度对齐，
+    /// 键盘音效的总音量 0–1。默认 0.6：各音色包已经做过响度对齐，
     /// 这个位置在 MacBook 内置扬声器上大致等于「听得见但不盖过视频」。
+    ///
+    /// ⚠️ 2026-08-23 扩包时对齐目标抬高了 1.56dB（见 `KeySoundPack.gain`），
+    /// 所以同一个滑块位置比 v1.0 整体响一点。默认值没跟着调——
+    /// 0.6 仍在合适区间，而改默认值会让老用户的音量莫名其妙地变。
     @Published var keySoundVolume: Double = Settings.double("keySoundVolume", 0.6) {
         didSet { Self.d.set(keySoundVolume, forKey: "keySoundVolume") }
     }
@@ -181,6 +185,14 @@ final class Settings: ObservableObject {
     /// 而已经存进 UserDefaults 的旧值遇到不认识的名字会退回默认包（见 `named`）。
     @Published var keySoundPack: String = d.string(forKey: "keySoundPack") ?? KeySoundPack.fallback.id {
         didSet { Self.d.set(keySoundPack, forKey: "keySoundPack") }
+    }
+
+    /// 自定义按键音的总开关。**默认打开，和 `keySoundEnabled` 的理由正好相反**：
+    /// 那个开关背后是一项权限，必须由用户主动同意；而指键本身就是用户一个键一个键
+    /// 点出来的主动行为，点完了却不响才是意外。这个开关的用途是快速 A/B
+    /// （「我加的音到底有没有起作用」），不是准入。
+    @Published var keySoundCustomEnabled: Bool = Settings.bool("keySoundCustomEnabled", true) {
+        didSet { Self.d.set(keySoundCustomEnabled, forKey: "keySoundCustomEnabled") }
     }
 
     /// 自动检查更新。**这是 App 唯一的网络请求**，所以给了明确的开关——

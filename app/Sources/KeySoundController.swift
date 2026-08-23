@@ -46,6 +46,14 @@ final class KeySoundController: ObservableObject {
 
     private let player = KeySoundPlayer()
 
+    /// 自定义按键音的数据源。**只读不写**——增删指键是 UI 的事，
+    /// 这里只在收敛时按当前内容把播放层重建一遍。
+    private let customStore: CustomSoundStore
+    /// 上一次建好的自定义层。留着是为了当下一次重建的缓存
+    /// （见 `LoadedCustomSounds.init(previous:)`）：用户在键盘图上每点一个键
+    /// 都会触发一次收敛，没有缓存的话每点一下都要把全部采样重解码。
+    private var loadedCustom: LoadedCustomSounds?
+
     private var globalMonitor: Any?
     private var localMonitor: Any?
     private var activeObserver: NSObjectProtocol?
@@ -58,7 +66,14 @@ final class KeySoundController: ObservableObject {
     /// 直接返回上次的结果），再调也只是白跑，还会让状态在两态之间来回跳。
     private var didRequestAccess = false
 
-    init() {
+    /// - Parameter customStore: 自定义音色的数据源。探针要塞一个指向临时目录的
+    ///   实例进来，正式路径传 nil 用全局那一份。
+    ///
+    ///   默认值写成 `nil` 再在函数体里取 `.shared`，**不能直接写
+    ///   `= .shared`**：默认实参是在**调用方**求值的，而调用方不一定在主 actor 上，
+    ///   Swift 6 语言模式下那是个编译错误（现在是警告）。
+    init(customStore: CustomSoundStore? = nil) {
+        self.customStore = customStore ?? .shared
         // **必须在这里查一次，不能等到第一次 apply()。**
         // 见 `grantedAtLaunch`：要记的是「本进程启动那一刻」的授权结果，
         // 而 apply() 只在功能开着时才会走到查询那一行——默认关闭的情况下，
@@ -222,8 +237,13 @@ final class KeySoundController: ObservableObject {
     /// **点名的那个 bundle id**，不需要 sudo，也碰不到别的应用。
     /// 拿不到 bundle id（比如探针那种裸可执行文件）就直接不做——
     /// 不带 id 的 `tccutil reset` 会清掉**所有**应用的该项授权，绝不能走到。
+    ///
+    /// `nonisolated`：只碰 `Bundle`/`Process`/`Log`（都线程安全），而
+    /// `waitUntilExit()` 是阻塞调用，本来就必须在后台队列跑。之前没标，
+    /// 从 `requestAccess` 的后台闭包里调它是 Swift 6 意义上的错误
+    /// （`-swift-version 5` 只报 ActorIsolatedCall 警告，别等到换语言模式才炸）。
     @discardableResult
-    static func resetOwnRecord() -> Bool {
+    nonisolated static func resetOwnRecord() -> Bool {
         guard let id = Bundle.main.bundleIdentifier, !id.isEmpty else {
             Log.write("[keysound] 无 bundle id，跳过授权记录重置")
             return false
@@ -308,6 +328,7 @@ final class KeySoundController: ObservableObject {
         }
 
         player.load(KeySoundPack.named(settings.keySoundPack))
+        refreshCustomLayer(settings)
         player.setVolume(settings.keySoundVolume)
         #if UI_PROBE
         // 探针里静音：要走的是完整的真实路径（装 monitor、起引擎、排 buffer），
@@ -328,6 +349,32 @@ final class KeySoundController: ObservableObject {
     private func teardown() {
         removeMonitors()
         player.stop()
+        // 自定义采样也一并放掉。功能关着/没授权时本功能的运行时开销要严格为零，
+        // 内存也算在内——一条 2 秒的采样解码后是三份 700KB 的 buffer。
+        loadedCustom = nil
+        player.setCustom(nil)
+    }
+
+    /// 按音色库的当前内容重建自定义层。幂等。
+    ///
+    /// 库或指键一变就要调（`AppDelegate` 订阅了 `CustomSoundStore`），
+    /// 否则用户在键盘图上点完，得关掉再打开开关才生效。
+    private func refreshCustomLayer(_ settings: Settings) {
+        // 总开关关掉、或者一个键都没指 → 整层不存在。
+        // 「没指键」这一支很重要：绝大多数用户永远不会用这个功能，
+        // 他们不该为此多出任何一次解码或一层查表。
+        guard settings.keySoundCustomEnabled, !customStore.assignments.isEmpty else {
+            loadedCustom = nil
+            player.setCustom(nil)
+            return
+        }
+        let layer = LoadedCustomSounds(entries: customStore.entries,
+                                       assignments: customStore.assignments,
+                                       directory: customStore.directory,
+                                       format: KeySoundPlayer.format,
+                                       previous: loadedCustom)
+        loadedCustom = layer
+        player.setCustom(layer)
     }
 
     // MARK: - 事件监听
@@ -377,10 +424,12 @@ final class KeySoundController: ObservableObject {
             // 而真实键盘按住一个键只有最初那一声。不滤掉的话按住退格
             // 就是一串连珠炮，比不做这个功能还糟。
             guard !event.isARepeat else { return }
-            player.play(KeySoundSlot(keyCode: event.keyCode), isDown: true, arrival: arrival)
+            player.play(KeySoundSlot(keyCode: event.keyCode), isDown: true,
+                        keyCode: event.keyCode, arrival: arrival)
 
         case .keyUp:
-            player.play(KeySoundSlot(keyCode: event.keyCode), isDown: false, arrival: arrival)
+            player.play(KeySoundSlot(keyCode: event.keyCode), isDown: false,
+                        keyCode: event.keyCode, arrival: arrival)
 
         case .flagsChanged:
             handleFlagsChanged(event, arrival: arrival)
@@ -407,7 +456,11 @@ final class KeySoundController: ObservableObject {
             // 按位推断的话「熄灭」那一次会被算成抬起，于是两次按键听起来不一样。
             // 它每次都是一次完整的按下，所以固定给按下音。
             let isDown = flag == .capsLock ? true : now.contains(flag)
-            player.play(.generic, isDown: isDown, arrival: arrival)
+            // **把真实键码带下去。** 这里原先只报 `.generic`，于是修饰键
+            // 在自定义层里是查不到的。左右 Shift / Option / Command 的键码不同
+            // （kVK_Shift=0x38 而 kVK_RightShift=0x3C），带上之后可以分别指音——
+            // 而槽位仍然给 `.generic`：音色包本来就没有修饰键的专属录音。
+            player.play(.generic, isDown: isDown, keyCode: event.keyCode, arrival: arrival)
         }
     }
 
@@ -476,6 +529,10 @@ final class KeySoundController: ObservableObject {
 
     var probeIsListening: Bool { globalMonitor != nil || localMonitor != nil }
     var probeEngineIsRunning: Bool { player.isRunning }
+    /// 「总开关关掉 → 自定义层整个旁路」这条线是收敛逻辑，不是播放逻辑，
+    /// 所以判据要落在 controller 上，不能只测 player
+    var probeCustomIsLoaded: Bool { player.probeCustomIsLoaded }
+    var probePlayer: KeySoundPlayer { player }
 
     /// 面板五态用。真实路径下 status 由 `apply` 收敛，探针要直接摆状态看外观。
     func setProbeStatus(_ s: KeySoundStatus) { status = s }

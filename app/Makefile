@@ -39,9 +39,10 @@ GLASS_FLAG := $(shell [ "$(SDK_MAJOR)" -ge 26 ] 2>/dev/null && echo -D LIQUID_GL
 
 # AVFoundation：键盘音效的播放（AVAudioEngine + 预载 PCM buffer）
 # IOKit：      查「输入监控」授权（IOHIDCheckAccess / IOHIDRequestAccess）
+# UniformTypeIdentifiers：导入自定义按键音时给 NSOpenPanel 过滤音频文件（UTType.audio）
 FLAGS   := -swift-version 5 -parse-as-library -target $(TARGET) $(GLASS_FLAG) \
            -framework SwiftUI -framework AppKit -framework ServiceManagement \
-           -framework AVFoundation -framework IOKit
+           -framework AVFoundation -framework IOKit -framework UniformTypeIdentifiers
 
 # UI 探针：复用 app 的**真实**视图和状态类型，只把入口换掉。
 # 排除 MagicKeyApp.swift（它带 @main），加上 Probe/UIProbe.swift。

@@ -108,12 +108,39 @@ make -C app uninstall
 
 敲击内置键盘时播放真实机械键盘的录音。它与背光效果彼此独立，可以单独使用，也可以同时开启。
 
-- 三套音色：**清脆**（Kailh Box Navy）、**厚实**（Holy Panda）、**轻柔**（Cherry MX Brown）
+- 十二套音色，按听感从脆到轻排列：
+
+  | | | |
+  |---|---|---|
+  | **清脆**（Box Navy） | **铿锵**（SKCM Blue Alps） | **老派**（IBM Buckling Spring） |
+  | **厚实**（Holy Panda） | **绵密**（Topre 静电容） | **浑厚**（NovelKeys Cream） |
+  | **深沉**（Gateron Ink Black） | **闷响**（Cherry MX Black） | **圆润**（Gateron Ink Red） |
+  | **顺滑**（Turquoise Tealios） | **轻柔**（Cherry MX Brown） | **安静**（Alpaca） |
+
 - 按下与抬起都有独立录音，空格、回车、退格另有专属采样，修饰键也会响
 - 长按只响按下与抬起两声，不会跟着系统的按键重复变成连珠炮
 - 每次播放在多条采样之间随机轮换，并叠加轻微的音量与音高抖动，连打不会听出机械感
-- 三套音色做过响度对齐，切换音色不会顺带改变音量
+- 十二套音色做过响度对齐，切换音色不会顺带改变音量
 - 停止敲击约 30 秒后自动停用音频引擎，下次按键再拉起
+
+#### 自定义按键音
+
+除了内置音色，还可以给**单个按键**指定自己的采样。设置窗口 →「键盘音效」→「自定义按键音…」
+打开一张 MacBook 键盘图，点哪个键就给哪个键选音。
+
+- 支持常见音频格式（mp3 / m4a / wav / aiff），单条不超过 2 秒
+- 导入时自动把响度对齐到与内置音色相同的目标，自己录的声音不会突然响一大截
+- 导入的文件会被拷贝进 `~/Library/Application Support/MagicKey/CustomSounds/`，
+  之后移动或删除原文件都不影响
+- 只替换**按下**的那一声，抬起仍用音色包——两声都换成同一条采样的话，
+  一次敲击会听到两遍一样的声音
+- 左右 Shift / Option / Command 的键码不同，可以分别指音
+- 有一个总开关，可随时关掉整层做 A/B，指键关系会保留
+
+> [!NOTE]
+> 触控 ID 不产生按键事件，所以键盘图上没有画它。
+> F1–F12 若没有在系统设置中设为标准功能键，直接按下发出的是亮度/音量之类的系统事件，
+> 不产生按键事件，指了也不会响。
 
 > [!IMPORTANT]
 > 这是 MagicKey 中**唯一**需要“输入监控”权限的功能，因此**默认关闭**，必须由你主动开启。
@@ -174,7 +201,7 @@ MagicKey 面向 MacBook 内置键盘背光；外接键盘不在支持范围内�
 | 常亮、呼吸、心跳、频闪 | 无额外权限 | 只写入键盘的全局亮度值 |
 | 按键脉冲 | 不需要“输入监控” | 只读取全局按键事件计数与距最近事件的时间，不读取 keycode 或输入内容 |
 | 音乐律动 | 需要“系统录音”，不是“麦克风” | 音频仅在内存中换算为低频能量与鼓点事件，随即丢弃 |
-| 键盘敲击音效 | 需要“输入监控”，**默认关闭** | 只用 keycode 判断该播空格、回车、退格还是通用采样；不记录、不保存、不上传任何按键内容 |
+| 键盘敲击音效 | 需要“输入监控”，**默认关闭** | 只用 keycode 决定播哪一条采样（内置音色按空格/回车/退格/通用分类；自定义按键音按 keycode 逐键查表）；不读取字符内容，不记录、不保存、不上传任何按键内容。写入磁盘的只有你自己导入的音频文件和一张“哪个键指了哪条音色”的表 |
 | 更新检查 | 启动时访问一次 GitHub Releases API，之后最多每 24 小时一次 | User-Agent 只包含应用名和版本，不发送设备标识或使用数据 |
 
 MagicKey 不录音、不写入音频文件、不上传声音、不包含遥测，也不发送崩溃报告。关闭“自动检查更新”后不会再自动联网；用户主动点击“检查更新”时仍会访问 GitHub。
@@ -250,7 +277,9 @@ DESIGN.md   架构、硬件实测与设计约束
 
 键盘敲击音效使用的全部采样来自 **[kbsim](https://github.com/tplai/kbsim)**（Mechanical Keyboard Simulator，[kbs.im](https://kbs.im)），作者 **Thomas Lai**，以 **MIT License** 发布。
 
-MagicKey 收录了其中三套：`boxnavy`、`holypanda`、`mxbrown`，文件逐字节未作修改，随应用分发于 `MagicKey.app/Contents/Resources/Sounds/`。许可证原文与完整来源说明一并打包在同一目录下的 `LICENSE-kbsim.txt` 与 `CREDITS.md` 中。
+MagicKey 收录了其中十二套：`alpaca`、`blackink`、`bluealps`、`boxnavy`、`buckling`、`cream`、`holypanda`、`mxblack`、`mxbrown`、`redink`、`topre`、`turquoise`，文件逐字节未作修改，随应用分发于 `MagicKey.app/Contents/Resources/Sounds/`。上游的第 13 套 `mxblue` 未收录——它缺少空格、回车、退格的专属采样，敲空格和敲字母会是同一个声音。
+
+许可证原文与完整来源说明（含每套包的实测 RMS 与响度对齐系数）一并打包在同一目录下的 `LICENSE-kbsim.txt` 与 `CREDITS.md` 中。
 
 感谢 Thomas Lai 以宽松许可发布这批录音。
 
