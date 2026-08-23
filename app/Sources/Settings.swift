@@ -89,7 +89,17 @@ enum EffectKind: String, CaseIterable, Identifiable {
 /// 用 UserDefaults 持久化。每个属性 didSet 即写盘——设置项少，不需要批量提交。
 final class Settings: ObservableObject {
 
+    /// **探针必须写在自己的域里。**
+    /// 本文件曾假定「裸可执行文件没有 bundle id，`UserDefaults.standard` 自然
+    /// 落在单独的域里」——2026-08-23 实测**是错的**：`make probe-ui` 跑完，
+    /// `io.github.xiaosong1223.MagicKey` 域里的 `keySoundEnabled` 被写成 0
+    /// （探针最后一步会把音效关掉收尾），等于**默默改掉用户正在用的设置**。
+    /// 判据：`defaults write … keySoundEnabled -bool true` → 跑探针 → 再读，变 0。
+    #if UI_PROBE
+    private static let d = UserDefaults(suiteName: "io.github.xiaosong1223.MagicKey.uiprobe")!
+    #else
     private static let d = UserDefaults.standard
+    #endif
 
     private static func double(_ key: String, _ fallback: Double) -> Double {
         d.object(forKey: key) == nil ? fallback : d.double(forKey: key)

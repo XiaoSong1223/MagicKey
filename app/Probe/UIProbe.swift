@@ -562,9 +562,11 @@ enum UIProbe {
         ///   - listening: 期望「装了 monitor 没有」
         ///   - engineRunning: 期望「音频引擎在不在跑」。nil = 不作判据，只打印
         func step(_ tag: String, enabled: Bool, atLaunch: Bool, granted: Bool,
+                  didRequest: Bool = false,
                   expect status: KeySoundStatus, listening: Bool, engineRunning: Bool?) {
             KeySoundController.setProbeLaunchAccess(atLaunch)
             KeySoundController.probeAccessOverride = granted
+            controller.setProbeDidRequest(didRequest)
             settings.keySoundEnabled = enabled
             controller.apply(settings)
             settle(0.4)
@@ -602,6 +604,19 @@ enum UIProbe {
         // 判据必须同时压住三项：状态是 needsRestart、monitor 未装、引擎没起。
         step("⑤ 启动时未授权，运行中才给", enabled: true, atLaunch: false, granted: true,
              expect: .needsRestart, listening: false, engineRunning: false)
+        // ⑥ 请求过了系统仍不放行——真机上就是「设置里开着、应用说没授权」那一态
+        //（TCC 旧记录绑的 cdhash 对不上，2026-08-23 实测）。
+        // 判据不只是 `.blocked`：这一态**同样一个 monitor 都不能装**，
+        // 而且面板必须给得出 `.regrant`，否则用户卡在这里出不去。
+        step("⑥ 请求过仍未放行（旧记录失效）", enabled: true, atLaunch: false, granted: false,
+             didRequest: true, expect: .blocked, listening: false, engineRunning: false)
+        if controller.action != .regrant {
+            failures.append("键盘音效「⑥」不对：blocked 态没给出「重新授权」按钮"
+                            + "（action=\(String(describing: controller.action))）")
+        }
+        // 阴性对照：没请求过时必须还是 `.needsPermission`，不能一律报 blocked
+        step("⑦ 没请求过（阴性对照）", enabled: true, atLaunch: false, granted: false,
+             didRequest: false, expect: .needsPermission, listening: false, engineRunning: false)
 
         return failures
     }
@@ -827,18 +842,19 @@ enum UIProbe {
         }
         updates.setProbeState(.idle)
 
-        // ── 5c. 键盘音效四态的面板高度 ─────────────────────────────
+        // ── 5c. 键盘音效各态的面板高度 ─────────────────────────────
         // 音效区在**所有**效果下都在，所以它撑高的是每一个面板。
-        // 未授权那一态还会多一行文字加一个按钮，是四态里最高的——
+        // 未授权那几态还会多一行文字加一个按钮，是里面最高的——
         // 加控件之前先看这一行会不会顶到窄屏上限。
         print("\n── 键盘音效五态（面板高度）──")
         settings.kind = .breathe
         let baseHeight = measure(label: "关闭", metrics: metrics).size.height
         settings.keySoundEnabled = true
-        // 「需重开」那句文案是五态里最长的，最可能折行把面板顶高——
+        // 「未放行」「需重开」那两句文案最长，最可能折行把面板顶高——
         // 正因如此它必须在这一组里，不能只测好看的那几态。
         for (name, s) in [("需要授权", KeySoundStatus.needsPermission),
-                          ("等待授权", .requesting),
+                          ("请求中",   .requesting),
+                          ("未放行",   .blocked),
                           ("需重开",   .needsRestart),
                           ("响应中",   .running)] {
             keySound.setProbeStatus(s)

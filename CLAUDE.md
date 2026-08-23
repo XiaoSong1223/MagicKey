@@ -136,8 +136,9 @@ xcrun --sdk macosx --show-sdk-version   # → 26.5
 - [ ] **键位黑名单**（禁掉 Delete/回车/F 键触发）——**需 Input Monitoring 权限**，
       2026-08-05 论证后推迟。三个理由：① 用户报告的实际痛点是长按钉在峰值，
       已由 `KeyRepeatFilter` 零权限解决，黑名单治不了它（按住任意字母键一样钉住）；
-      ② ~~TCC 授权绑定代码签名，ad-hoc 签名每次 `make install` 都掉授权~~
-      **这条 2026-08-06 已被实测推翻**（见「踩过的坑」），不再是推迟的理由；③ 会推翻「零权限」这条产品线。
+      ② TCC 授权绑定代码签名，ad-hoc 签名每次 `make install` 都掉授权
+      （2026-08-06 曾以为推翻，08-23 由 tccd 日志证实成立，见「踩过的坑」）；
+      ③ 会推翻「零权限」这条产品线。
       真要做时：`CGEventTap` 监听 `.keyDown` 取 keycode，做成默认关闭的可选项，
       未授权时静默降级回纯 `KeyRepeatFilter` 行为。
       （2026-08-23 注：键盘音效已把「输入监控」做成可选项且用的是 `NSEvent` 监听而非
@@ -228,13 +229,44 @@ xcrun --sdk macosx --show-sdk-version   # → 26.5
 加了节奏历史后状态跨轮污染，第二轮开头会算出负间隔。签名已改成收 `() -> Effect`，
 每轮现造。**以后给分析器加任何有状态的东西，先确认这一点。**
 
-**TCC 授权不跟代码签名走。** 本文件曾把「TCC 授权绑定代码签名，ad-hoc 签名每次
-`make install` 都掉授权」当成键位黑名单推迟的第二条理由——**实测是错的**。
-2026-08-06 用探针连测 5 次：改源码重建、cdhash 每次都变（`dc6f853f`→`d7c2e464`→
-`901fc804`→`5e31c27a`→`3c9c2098`），同路径同 bundle ID 下**授权一直有效**。
-所以「等 Developer ID 之后再做」对开发期的 TCC 功能不成立。
-（保留一个未验的口子：`make install` 是 `rm -rf` 再 `cp -R`，整个 bundle 重建，
-没单独测过。但音乐律动天天在用同一条路径，真会掉早就发现了。）
+**TCC 授权确实跟代码签名走，每次 `make install` 都会失效——而且失效得毫无声响。**
+本文件 2026-08-06 曾写「实测推翻，授权一直有效」，**那条结论是错的**，
+2026-08-23 被 tccd 日志直接证伪。判据只有一行：
+
+```bash
+log show --last 10m --style compact --predicate 'process == "tccd"' | grep -i magickey
+# → Failed to match existing code requirement for subject io.github.xiaosong1223.MagicKey
+#   and service kTCCServiceListenEvent        （AudioCapture 那条同样在报）
+```
+
+根因是 ad-hoc 签名的指定要求就是二进制哈希本身：
+
+```bash
+codesign -d -r- /Applications/MagicKey.app   # → designated => cdhash H"938f5197…"
+```
+
+TCC 在授权那一刻把这条要求存进记录，之后**改一行代码、重新编译，cdhash 就变了**，
+记录再也匹配不上。08-06 那次探针之所以报「一直有效」，最可能是它验的量本身
+不区分授权与否（`AudioHardwareCreateProcessTap` 未授权照样返回 0，见下一条）——
+**一个查不到东西的检查报通过，比没有这个检查更糟**，这里又中了一次。
+
+失效的样子最坑人：**系统设置里那个开关还是打开的、名字也还是 MagicKey**，
+而应用查到的是未授权。用户会反复去点那个开关、反复重启应用，全都没用；
+`IOHIDRequestAccess` 这时既不弹框也不放行，直接返回 false。
+唯一的出路是把那条记录删掉重来（不需要 sudo，只影响点名的那个 bundle id）：
+
+```bash
+tccutil reset ListenEvent io.github.xiaosong1223.MagicKey
+tccutil reset Microphone  io.github.xiaosong1223.MagicKey   # 「系统录音」同理
+```
+
+`KeySoundController.resetOwnRecord()` 就是在应用内跑这一行：面板上的
+「重新授权」按钮先清记录再 `IOHIDRequestAccess`，否则用户卡在「等待授权」出不去。
+**这不只是开发期的麻烦**——发行包也是 ad-hoc 签名，所以每发一个新版本，
+老用户的「输入监控」都会这样静默失效。Developer ID 签名能根治
+（那时指定要求变成证书链，与二进制内容无关）；在那之前也可以本地建一个
+自签名证书固定签名来免掉开发期的反复授权，代价是要在钥匙串里放一份身份并授权
+codesign 使用它（会弹一次系统对话框，无法在无 TTY 的环境里跑完）。
 
 **Process tap 的失败模式是死锁，不是错误码。** 未授权时
 `AudioHardwareCreateProcessTap` **照样返回 0**，真正卡住的是后面的
@@ -588,6 +620,8 @@ x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_A
 ③ **探针测不到「被拒绝」**：从终端起的裸可执行文件，TCC 把它算在**终端**头上
 （实测返回终端的「已授权」），降级分支永远走不到——必须 `probeAccessOverride` 注入，
 launch 快照同理要 `setProbeLaunchAccess` 可注入。
+④ **重新构建之后授权会静默失效，而设置里的开关仍显示打开**——见上面
+「TCC 授权确实跟代码签名走」那条。面板的 `.blocked` 态和「重新授权」按钮就是为它做的。
 
 **「丢档比例」不是感知指标。** 判据是最大**相对**亮度步进（韦伯定律）。
 高亮度区跳 3 档只有 2% 变化看不出来，档位 2 附近跳 3 档是 150% 一眼可见。

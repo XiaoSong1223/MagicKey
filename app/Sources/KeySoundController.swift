@@ -14,8 +14,12 @@ enum KeySoundStatus: Equatable {
     case off
     /// 开着，但没有「输入监控」授权。**此时一个 monitor 都不装**
     case needsPermission
-    /// 已经弹过系统授权框，等用户处理
+    /// 系统授权框正弹着，等用户处理。**只在 `IOHIDRequestAccess` 未返回期间存在**
     case requesting
+    /// 请求过了，系统仍然不放行。绝大多数时候是**旧授权记录失效**：
+    /// TCC 那条记录绑的是授权当时的代码签名，重新构建/更新之后对不上，
+    /// 而系统设置里的开关**看着还是打开的**。详见 `resetOwnRecord()`。
+    case blocked
     /// 授权拿到了，但**是在本进程启动之后才拿到的**，对已经在跑的进程不生效。
     /// 这一态下同样一个 monitor 都不装——装了也收不到任何事件。
     /// 详见 `KeySoundController.grantedAtLaunch`。
@@ -86,7 +90,24 @@ final class KeySoundController: ObservableObject {
         #if UI_PROBE
         if let forced = probeAccessOverride { return forced }
         #endif
-        return IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
+        let raw = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)
+        // **只在变化时打**：`apply()` 每次收敛都会走到这里，无条件打日志
+        // 等于把统一日志刷满，真出问题时反而找不到那一行。
+        if raw != lastLoggedAccess {
+            lastLoggedAccess = raw
+            Log.write("[keysound] IOHIDCheckAccess(ListenEvent) = \(describe(raw))")
+        }
+        return raw == kIOHIDAccessTypeGranted
+    }
+
+    private static var lastLoggedAccess: IOHIDAccessType?
+
+    private static func describe(_ t: IOHIDAccessType) -> String {
+        switch t {
+        case kIOHIDAccessTypeGranted: return "granted"
+        case kIOHIDAccessTypeDenied:  return "denied"
+        default:                      return "unknown(\(t.rawValue))"
+        }
     }
 
     /// 本进程**启动那一刻**的授权结果。由 `init()` 抓一次，之后永不更新。
@@ -109,7 +130,13 @@ final class KeySoundController: ObservableObject {
     private static var launchAccess: Bool?
 
     private static func captureLaunchAccess() {
-        if launchAccess == nil { launchAccess = accessGranted() }
+        guard launchAccess == nil else { return }
+        launchAccess = accessGranted()
+        // `KeySoundController` 是 `AppDelegate` 的存储属性，构造发生在
+        // `override init()` 的**函数体之前**，而 `Log.sink` 是在函数体里设的——
+        // 上面那次查询的日志必然掉进空 sink。清掉节流标记，让第一次 `apply()`
+        // 把它补打出来，否则「启动时到底有没有授权」在日志里永远看不到。
+        lastLoggedAccess = nil
     }
 
     /// 退出并重新打开自己，让「输入监控」授权生效。
@@ -158,17 +185,63 @@ final class KeySoundController: ObservableObject {
     /// 触发系统授权框。用户**主动打开开关**时才调——不能在启动时调，
     /// 那等于一装上就跟人要「看你按的每一个键」的权限。
     func requestAccess() {
-        guard !didRequestAccess else { openInputMonitoringSettings(); return }
         didRequestAccess = true
         status = .requesting
         // 放到后台队列：这个调用在用户点掉对话框之前可能不返回，
         // 卡在主线程上就是整个 UI 假死。对话框是系统进程画的，不需要我们在主线程。
         DispatchQueue.global(qos: .userInitiated).async {
+            // **每次都先清掉自己那条旧记录。** 只要走到这里就说明当前没有授权，
+            // 那条记录要么不存在（清了是空操作），要么已经失效或是「拒绝」——
+            // 三种情况都该清。不清的话 `IOHIDRequestAccess` 会既不弹框也不放行，
+            // 用户就卡在「等待授权」上出不去了（2026-08-23 真机踩到）。
+            let didReset = Self.resetOwnRecord()
             let granted = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
             Task { @MainActor [weak self] in
-                Log.write("[keysound] 已请求「输入监控」授权，返回 \(granted)")
+                Log.write("[keysound] 已请求「输入监控」授权（先重置记录=\(didReset)），返回 \(granted)")
                 self?.recheckAccess()
             }
+        }
+    }
+
+    /// 删掉 TCC 里**本应用自己**这一条「输入监控」记录，好让下一次请求重新弹框。
+    ///
+    /// ## 为什么必须能清
+    ///
+    /// TCC 记录里存的是授权当时的**代码要求**（`csreq`）。ad-hoc 签名的
+    /// 指定要求就是 `cdhash H"…"`——一个字节都不能变的二进制哈希，
+    /// **每次重新构建、每次版本更新都不一样**。于是：
+    ///
+    /// - 系统设置里那个开关还亮着，名字也还是 MagicKey；
+    /// - `IOHIDCheckAccess` 却返回未授权，tccd 日志里是
+    ///   `Failed to match existing code requirement ... kTCCServiceListenEvent`；
+    /// - 用户看到的是「我明明授权了」，而在设置里点开关、重启应用统统没用。
+    ///
+    /// 这是本项目实测踩到的（2026-08-23）。唯一的出路是把那条记录删掉重来。
+    ///
+    /// `tccutil` 是系统自带的公开命令，`reset <service> <bundle-id>` 只影响
+    /// **点名的那个 bundle id**，不需要 sudo，也碰不到别的应用。
+    /// 拿不到 bundle id（比如探针那种裸可执行文件）就直接不做——
+    /// 不带 id 的 `tccutil reset` 会清掉**所有**应用的该项授权，绝不能走到。
+    @discardableResult
+    static func resetOwnRecord() -> Bool {
+        guard let id = Bundle.main.bundleIdentifier, !id.isEmpty else {
+            Log.write("[keysound] 无 bundle id，跳过授权记录重置")
+            return false
+        }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        task.arguments = ["reset", "ListenEvent", id]
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        do {
+            try task.run()
+            task.waitUntilExit()
+            let ok = task.terminationStatus == 0
+            Log.write("[keysound] 已重置「输入监控」授权记录（\(id)）：\(ok ? "成功" : "失败")")
+            return ok
+        } catch {
+            Log.write("[keysound] 重置授权记录失败：\(error.localizedDescription)")
+            return false
         }
     }
 
@@ -186,6 +259,16 @@ final class KeySoundController: ObservableObject {
     static let restartHint =
         "在系统设置里勾选之后，需要退出并重新打开 MagicKey 才会生效——"
         + "这是「输入监控」权限的固有行为，不是设置没保存。"
+
+    /// 「系统设置里明明是打开的，应用却说没授权」时要说的那句话。
+    ///
+    /// 这一态**最像 bug**，也最容易让人在开关上来回点：系统那条授权记录绑的是
+    /// 授权当时的代码签名，MagicKey 每次重新构建/更新签名都会变，旧记录随之失效，
+    /// 但设置界面照旧把它画成打开的。
+    static let staleHint =
+        "系统里那条授权记录绑的是授权当时的应用签名，MagicKey 更新后就对不上了，"
+        + "而设置界面仍然把它显示成打开的。点这里会清掉这条旧记录并重新申请授权，"
+        + "之后需要重新打开一次 MagicKey。"
 
     // MARK: - 收敛
 
@@ -208,7 +291,10 @@ final class KeySoundController: ObservableObject {
             // 只会在系统里留一条「这个 app 想监听输入」的记录）、不起音频引擎、
             // 不开定时器。这一态下本功能的运行时开销严格为零。
             teardown()
-            status = didRequestAccess ? .requesting : .needsPermission
+            // 请求过一次还是不放行 → `.blocked`，**不能停在 `.requesting`**：
+            // 那一态的按钮只会再把系统设置打开一次，而设置里的开关看着是好的，
+            // 用户就卡死在「等待授权」上出不来了。
+            status = didRequestAccess ? .blocked : .needsPermission
             return
         }
 
@@ -333,6 +419,7 @@ final class KeySoundController: ObservableObject {
         case .running:                     return .good
         case .off:                         return .neutral
         case .needsPermission, .requesting: return .warn
+        case .blocked:                     return .warn
         case .needsRestart:                return .warn
         case .failed:                      return .bad
         }
@@ -344,7 +431,11 @@ final class KeySoundController: ObservableObject {
         switch status {
         case .off:             return "未启用"
         case .needsPermission: return "需要「输入监控」权限"
-        case .requesting:      return "等待授权 · 授权后需重启 MagicKey"
+        case .requesting:      return "正在请求「输入监控」授权…"
+        // 「等待授权」这种说法在这一态是骗人的：系统那边**已经有答复了，就是不放行**。
+        // 而最常见的成因（旧记录失效）恰好长得和「设置里已经打开」一模一样，
+        // 所以这句话必须把那个矛盾直接点出来，否则用户只会反复去开关那个开关。
+        case .blocked:         return "系统未放行 · 设置里已开启则是旧记录失效"
         // 措辞要同时说清「你没做错」和「还差一步」——这一态最容易被当成 bug
         case .needsRestart:    return "已授权 · 退出并重新打开 MagicKey 后生效"
         case .failed(let why): return "音效未能启动：\(why)"
@@ -356,13 +447,14 @@ final class KeySoundController: ObservableObject {
     var action: Action? {
         switch status {
         case .needsPermission: return .grant
-        case .requesting:      return .openSettings
+        case .blocked:         return .regrant
+        case .requesting:      return nil
         case .needsRestart:    return .restart
         default:               return nil
         }
     }
 
-    enum Action { case grant, openSettings, restart }
+    enum Action { case grant, regrant, openSettings, restart }
 
     // MARK: - 探针
 
@@ -387,5 +479,9 @@ final class KeySoundController: ObservableObject {
 
     /// 面板五态用。真实路径下 status 由 `apply` 收敛，探针要直接摆状态看外观。
     func setProbeStatus(_ s: KeySoundStatus) { status = s }
+
+    /// 摆布「请求过没有」。`.blocked` 只在请求过之后才可能出现，
+    /// 不能注入这个就测不到那一支。
+    func setProbeDidRequest(_ v: Bool) { didRequestAccess = v }
     #endif
 }

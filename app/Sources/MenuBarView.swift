@@ -297,6 +297,10 @@ struct MenuBarView: View {
             Button("授权") { keySound.requestAccess() }
                 .buttonStyle(.link).font(.caption)
                 .help("弹出系统的「输入监控」授权框。" + KeySoundController.restartHint)
+        case .regrant:
+            Button("重新授权") { keySound.requestAccess() }
+                .buttonStyle(.link).font(.caption)
+                .help(KeySoundController.staleHint)
         case .openSettings:
             Button("打开设置") { keySound.openInputMonitoringSettings() }
                 .buttonStyle(.link).font(.caption)
