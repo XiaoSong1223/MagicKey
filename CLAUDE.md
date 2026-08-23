@@ -263,6 +263,22 @@ xcrun --sdk macosx --show-sdk-version   # → 26.5
 定参只能靠真实输入，而最终判据是眼睛——检出率能证明「数量对了」，
 证明不了「闪在拍子上」，这两件事在数字上一模一样。
 
+**`AVAudioEngine.stop()` 之后 player node 的 `isPlaying` 仍是 true，
+按它决定要不要补 `play()` 会永久哑掉。** 键盘音效上线当天用户就报了
+「开关关一次再开就没声」：`stop()` 作废了节点的渲染状态，但 12/12 个节点的
+`isPlaying` 全留在 true，`start()` 里 `for node where !node.isPlaying { play() }`
+整段跳过——引擎显示在跑、scheduleBuffer 正常返回、延迟打点全对，就是没有声音。
+修法：拉起时**无条件**先 `node.stop()` 再 `node.play()`（`pause()` 恢复的路径
+不受此害，但统一走这条无损）。这个 bug 逃过验收是因为当时的 harness 只量
+「事件到达 → scheduleBuffer」的**时序**——时序证明不了**渲染**。判据必须是
+在音频图上装 tap 量出 RMS > 0；`probe-ui` 的「渲染回归」组就是这么建的
+（mixer 音量 0 + tap 打在 player 节点上，静默可测，带不敲键的阴性对照）。
+
+**NSLog 的动态内容在统一日志里是 `<private>`，装好的 app 等于没有日志。**
+`log stream/show` 按内容过滤（哪怕搜格式串后面的 "[keysound]"）一条都查不到，
+诊断时两眼一抹黑。`Log.sink` 已改走 `os.Logger` + `privacy: .public`，查日志用：
+`log stream --predicate 'subsystem == "io.github.xiaosong1223.MagicKey"'`。
+
 **衰减包络别用指数。** 指数永远到不了 0，截断时会留下可见台阶。
 幂函数 `(1-u)^1.6` 精确落到 0，实测 0.4s 脉冲最长单档停留仅 10.8ms、档位利用率 80%。
 

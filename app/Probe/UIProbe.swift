@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import AVFoundation
 
 // MagicKey UI 探针
 //
@@ -605,6 +606,74 @@ enum UIProbe {
         return failures
     }
 
+    /// 键盘音效：**声音真的渲染出来了吗。**
+    ///
+    /// 「scheduleBuffer 被调用了」和「有声」是两回事：`engine.stop()` 会作废
+    /// player node 的渲染状态而 `isPlaying` 仍留在 true，`start()` 若按
+    /// `!isPlaying` 跳过补 play()，之后排什么都无声——引擎显示在跑、时序打点
+    /// 全部正常，只有在音频图上装 tap 量 RMS 才测得出。
+    /// 「开关关一次再开就哑」（2026-08-23 用户真机报告）当初就是这么漏掉的。
+    ///
+    /// **完全静默**：mixer 总音量设 0，tap 打在各 **player 节点**上——
+    /// 节点渲染不渲染与下游 mixer 音量无关，量得到又听不到。
+    static func keySoundRenderChecks() -> [String] {
+        print("\n── 键盘音效：渲染回归（静默，tap 在混音前）──")
+        var failures: [String] = []
+
+        final class Meter: @unchecked Sendable {
+            private var sum = 0.0
+            private var n = 0
+            private let lock = NSLock()
+            func add(_ buf: AVAudioPCMBuffer) {
+                guard let ch = buf.floatChannelData else { return }
+                var s = 0.0
+                for i in 0..<Int(buf.frameLength) { let v = Double(ch[0][i]); s += v * v }
+                lock.lock(); sum += s; n += Int(buf.frameLength); lock.unlock()
+            }
+            func readAndReset() -> Double {
+                lock.lock(); defer { lock.unlock() }
+                let rms = n > 0 ? (sum / Double(n)).squareRoot() : 0
+                sum = 0; n = 0
+                return rms
+            }
+        }
+
+        let player = KeySoundPlayer()
+        player.load(KeySoundPack.named(KeySoundPack.fallback.id))
+        player.setVolume(0)   // 回归测试不许出声
+        defer { player.stop() }
+
+        let meter = Meter()
+        for node in player.probeEngine.attachedNodes.compactMap({ $0 as? AVAudioPlayerNode }) {
+            node.installTap(onBus: 0, bufferSize: 1024, format: nil) { buf, _ in meter.add(buf) }
+        }
+
+        func measure(_ tag: String, hit: Bool, expectSound: Bool, _ prep: () -> Void) {
+            prep()
+            _ = meter.readAndReset()
+            if hit { player.play(.generic, isDown: true, arrival: CFAbsoluteTimeGetCurrent()) }
+            settle(0.4)
+            let rms = meter.readAndReset()
+            let sounded = rms > 1e-6
+            let ok = sounded == expectSound
+            print(String(format: "  %@ rms=%.6f → %@  %@",
+                         tag, rms, sounded ? "有声" : "无声", ok ? "✅" : "❌"))
+            if !ok {
+                failures.append("键盘音效渲染「\(tag)」：期望\(expectSound ? "有" : "无")声，"
+                                + String(format: "实测 rms=%.6f", rms))
+            }
+        }
+
+        measure("① 新引擎首播        ", hit: true, expectSound: true) { player.start() }
+        // ② 就是「开关关一次再开」。修掉的那个 bug 在这里会报 rms=0
+        measure("② stop 后重启再播   ", hit: true, expectSound: true) { player.stop(); player.start() }
+        measure("③ 空闲暂停后恢复播  ", hit: true, expectSound: true) { player.probeForceIdlePause() }
+        // ④ 阴性对照：不敲键必须量到 0——证明探头不是永远报「有声」
+        measure("④ 不敲键（阴性对照）", hit: false, expectSound: false) { }
+
+        return failures
+    }
+
     /// 设置窗口每次打开都在屏幕正中
     static func settingsCenterChecks(settings: Settings, updates: UpdateChecker) -> [String] {
         print("\n── 设置窗口位置 ──")
@@ -820,6 +889,7 @@ enum UIProbe {
         // 放在最后：settingsCenterChecks 会把 activationPolicy 切成 .regular，
         // 别让它影响前面那些尺寸测量。
         failures += keySoundChecks(settings: settings)
+        failures += keySoundRenderChecks()
         failures += anchorChecks()
         failures += focusChecks()
         failures += settingsCenterChecks(settings: settings, updates: updates)

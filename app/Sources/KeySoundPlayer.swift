@@ -115,9 +115,15 @@ final class KeySoundPlayer {
             Log.write("[keysound] 音频引擎启动失败：\(error.localizedDescription)")
             return
         }
-        // 节点一旦 playing 就一直 playing（没有排期时它只是空转，不占 CPU），
-        // 所以这里一次性开好，播放路径上不再碰 play()。
-        for node in voices where !node.isPlaying { node.play() }
+        // **节点必须无条件先 stop 再 play，不能按 isPlaying 跳过。**
+        // `engine.stop()` 会作废 player node 的渲染状态，但 `isPlaying` 留在
+        // true（实测 12/12 全是 true）——按 `!isPlaying` 补 play() 会整段跳过，
+        // 此后 scheduleBuffer 排什么都无声：「开关关一次再开就哑」的根因就是这行。
+        // 先 stop 把节点状态归零，再 play 才真的接回渲染。
+        // pause 恢复的路径本不受此害，但统一走这条也无损：暂停期间残留的排期
+        // 本来就是过期的敲击，丢掉是对的。
+        for node in voices { node.stop() }
+        for node in voices { node.play() }
         Log.write(String(format: "[keysound] 引擎拉起 %.2fms", (CFAbsoluteTimeGetCurrent() - t0) * 1000))
         armIdleTimer()
     }
@@ -223,4 +229,15 @@ final class KeySoundPlayer {
         latencySum = 0
         latencyMax = 0
     }
+
+    // MARK: - 探针
+
+    #if UI_PROBE
+    /// **只在探针里编译。** 渲染验证要在 mainMixer 上装 tap 量实际输出的 RMS——
+    /// 「scheduleBuffer 被调用了」和「真的有声音渲染出来」是两回事，
+    /// 时序打点证明不了后者。
+    var probeEngine: AVAudioEngine { engine }
+    /// 模拟「空闲 30 秒」那一下，不用真等 30 秒
+    func probeForceIdlePause() { idleTimeoutFired() }
+    #endif
 }

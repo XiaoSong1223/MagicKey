@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import Combine
+import os
 
 /// **不用 `MenuBarExtra`。** 它的面板窗口只涨不缩：展开「高级」把窗口撑高之后，
 /// 收回、切换效果、甚至关掉重开都停在最高那次的高度，下面留一大片空白。
@@ -45,10 +46,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
     private var panelHost: (any PanelSizeSyncing)?
     private var statusImages: [Bool: NSImage] = [:]
 
+    /// 统一日志出口。**不能用 NSLog**：它的动态内容（%@ 那部分）在统一日志里
+    /// 被标成 <private>，`log stream/show` 按内容过滤一条都查不到（2026-08-23 实测，
+    /// 连 "[keysound]" 都搜不出来），装好的 app 等于没有日志。
+    /// `Logger` + `privacy: .public` 才是可查的：
+    ///   log stream --predicate 'subsystem == "io.github.xiaosong1223.MagicKey"'
+    private static let logger = os.Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "io.github.xiaosong1223.MagicKey",
+        category: "app")
+
     override init() {
         // 必须在 Engine() 之前——引擎构造时就会做崩溃恢复并输出日志，
         // 放到 applicationDidFinishLaunching 里就晚了，那几行会漏掉。
-        Log.sink = { NSLog("[MagicKey] %@", $0) }
+        Log.sink = { Self.logger.notice("\($0, privacy: .public)") }
         settings = Settings()
         engine = Engine()
         super.init()
