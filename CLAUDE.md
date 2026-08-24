@@ -106,7 +106,7 @@ xcrun --sdk macosx --show-sdk-version   # → 26.5
 
 | 卡点 | 影响 | 解法 |
 |---|---|---|
-| **未代码签名/公证** | 开机自启不可用；别人下载会被 Gatekeeper 拦 | 需要 Apple Developer ID（$99/年） |
+| **未代码签名/公证** | 开机自启不可用；别人下载会被 Gatekeeper 拦；**每次构建都掉 TCC 授权** | 需要 Apple Developer ID（$99/年）。开发期可用 `bash tools/dev-signing-identity.sh` 建一张固定的自签名证书，指定要求就从 cdhash 变成 certificate leaf，重新编译不再掉授权（`app/Makefile` 自动检测，没建过就退回 ad-hoc） |
 | **能耗未实测** | 唯一未覆盖的风险：60Hz 唤醒阻止 SoC 深度空闲 | 已用「空闲即停」硬需求结构性消除。方法见 `tools/TESTING.md` |
 | **macOS 14/15 外观是「能用」不是「做过」** | 2026-08-11 决定不为旧系统做外观。系统控件自动走旧绘制路径（免费），唯一的自定义玻璃有回退：选中格是着色底＋accent 描边，看得见但没设计过；也没有 14/15 的机器可实测 | 真要支持就得先有机器 |
 | **发行包是 arm64 单架构** | **Intel Mac 连启动都做不到**（不是外观问题）。而 2020 年前的 MacBook 全是 Intel 且全都有背光键盘，正是目标用户 | `lipo -create` 编 universal 只是一行，但 CoreBrightness 私有接口在 Intel 上是否存在**无机器可验**。README 已写明「Intel 机型无法启动」 |

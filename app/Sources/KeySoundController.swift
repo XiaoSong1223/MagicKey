@@ -204,15 +204,25 @@ final class KeySoundController: ObservableObject {
         status = .requesting
         // 放到后台队列：这个调用在用户点掉对话框之前可能不返回，
         // 卡在主线程上就是整个 UI 假死。对话框是系统进程画的，不需要我们在主线程。
+        // **在主线程上先问清楚，别把这一问带进后台队列。**
+        // `accessGranted()` 是 `@MainActor` 的（它还要更新日志节流标记），
+        // 从后台队列调是数据竞争——`-swift-version 5` 只给警告，但它是真的错。
+        let stale = !Self.accessGranted()
+
         DispatchQueue.global(qos: .userInitiated).async {
-            // **每次都先清掉自己那条旧记录。** 只要走到这里就说明当前没有授权，
-            // 那条记录要么不存在（清了是空操作），要么已经失效或是「拒绝」——
-            // 三种情况都该清。不清的话 `IOHIDRequestAccess` 会既不弹框也不放行，
-            // 用户就卡在「等待授权」上出不去了（2026-08-23 真机踩到）。
-            let didReset = Self.resetOwnRecord()
+            // **只有在「当前确实没授权」时才清记录。**
+            //
+            // 清记录是为了治「记录还在、但绑的签名对不上」——那种情况下
+            // `IOHIDRequestAccess` 既不弹框也不放行，不清就出不去（2026-08-23 踩到）。
+            // 但它是**破坏性**的：记录本来有效时清掉，用户就真得再去系统设置授权一次。
+            // 所以先问一句。授权明明有效却走到这里（比如 tap 因别的原因没建起来），
+            // 那不是记录的问题，清了只会凭空制造一次重新授权——
+            // 用户报的「关掉音效再打开就要我重新设置权限」就是这么来的。
+            let didReset = stale ? Self.resetOwnRecord() : false
             let granted = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
             Task { @MainActor [weak self] in
-                Log.write("[keysound] 已请求「输入监控」授权（先重置记录=\(didReset)），返回 \(granted)")
+                Log.write("[keysound] 已请求「输入监控」授权"
+                          + "（记录失效=\(stale) 已重置=\(didReset)），返回 \(granted)")
                 self?.recheckAccess()
             }
         }
@@ -340,7 +350,12 @@ final class KeySoundController: ObservableObject {
         // 两者就是不一致的。少了这一步会亮着绿灯一声不出，而那是最坏的一态。
         guard installMonitors() else {
             teardown()
-            status = .blocked
+            // **分清两种失败，因为两种的按钮做的事完全不同。**
+            // 授权无效 → `.blocked`，按钮会清记录重新申请（破坏性，但那条记录本来就废了）；
+            // 授权有效却建不起 tap → 几乎一定是「授权在本进程启动之后才生效」，
+            // 该给的是 `.needsRestart`（退出重开，无损）。这里给错就会让
+            // 「重新授权」按钮去清一条好记录，把用户推去系统设置白走一趟。
+            status = Self.accessGranted() ? .needsRestart : .blocked
             return
         }
         player.start()
@@ -414,6 +429,9 @@ final class KeySoundController: ObservableObject {
     @discardableResult
     private func installMonitors() -> Bool {
         guard eventTap == nil else { return true }
+        #if UI_PROBE
+        if Self.probeForceTapFailure { return false }
+        #endif
 
         // 装的这一刻用户可能正按着 Shift。不种下当前值的话，第一次
         // flagsChanged（松开 Shift）会被算成「按下」，凭空多一声。
@@ -596,6 +614,11 @@ final class KeySoundController: ObservableObject {
     /// 探针要在一次运行里同时测「启动就有授权」和「启动时没有、跑起来才给」
     /// 两条分支，就必须能逐步重设它。
     static func setProbeLaunchAccess(_ v: Bool?) { launchAccess = v }
+
+    /// **只在 UI 探针里编译。** 强制 `installMonitors()` 失败。
+    /// 「授权有效但 tap 建不起来」这一支在探针里自然走不到（终端有输入监控，
+    /// tap 一建就成），不能注入就测不到它该报 `.needsRestart` 而不是 `.blocked`。
+    static var probeForceTapFailure = false
 
     var probeIsListening: Bool { eventTap != nil }
     var probeEngineIsRunning: Bool { player.isRunning }

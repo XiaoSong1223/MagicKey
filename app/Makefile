@@ -27,6 +27,17 @@ SOUND_FILES  := $(shell find $(SOUNDS_DIR) -type f 2>/dev/null)
 SWIFTC  := swiftc
 TARGET  := arm64-apple-macos14.0
 
+# 签名身份。**ad-hoc 签名的指定要求就是 cdhash**，改一行代码重新编译，
+# TCC 里那条授权记录就再也匹配不上——「输入监控」「系统录音」每次
+# `make install` 都要重授一遍（系统设置里的开关还显示是开的，最坑人的地方）。
+#
+# `tools/dev-signing-identity.sh` 会在登录钥匙串里建一张固定的自签名证书，
+# 用它签出来的指定要求是 `certificate leaf H"…"`，和二进制内容无关，
+# 重新编译不再影响授权。没建过就自动退回 ad-hoc，行为和以前一样。
+DEV_SIGN_CN := MagicKey Local Dev
+SIGN_ID := $(shell security find-certificate -c "$(DEV_SIGN_CN)" >/dev/null 2>&1 \
+             && echo "$(DEV_SIGN_CN)" || echo -)
+
 # Liquid Glass（glassEffect / GlassEffectContainer）只存在于 macOS 26 SDK。
 # 用**构建时的 SDK 版本**决定要不要编那段代码——注意这和 deployment target
 # 是两回事：SDK 26 + target 14.0 完全合法，玻璃代码由 @available(macOS 26.0)
@@ -67,9 +78,9 @@ $(BUNDLE): $(SOURCES) Resources/Info.plist $(RESOURCES) $(SOUND_FILES)
 	@cp $(RESOURCES) $(CONTENTS)/Resources/
 	@cp -R $(SOUNDS_DIR) $(CONTENTS)/Resources/
 	$(SWIFTC) -O $(FLAGS) $(SOURCES) -o $(CONTENTS)/MacOS/$(APP)
-	@codesign --force --sign - $(BUNDLE) 2>/dev/null || \
-	  echo "⚠️  ad-hoc 签名失败，开机自启可能不可用"
-	@echo "✅ 已生成 $(BUNDLE)"
+	@codesign --force --sign "$(SIGN_ID)" $(BUNDLE) 2>/dev/null || \
+	  echo "⚠️  签名失败（身份：$(SIGN_ID)），开机自启可能不可用"
+	@echo "✅ 已生成 $(BUNDLE)（签名身份：$(SIGN_ID)）"
 
 debug: $(SOURCES) Resources/Info.plist $(RESOURCES) $(SOUND_FILES)
 	@rm -rf $(BUNDLE)
@@ -78,7 +89,7 @@ debug: $(SOURCES) Resources/Info.plist $(RESOURCES) $(SOUND_FILES)
 	@cp $(RESOURCES) $(CONTENTS)/Resources/
 	@cp -R $(SOUNDS_DIR) $(CONTENTS)/Resources/
 	$(SWIFTC) -Onone -g $(FLAGS) $(SOURCES) -o $(CONTENTS)/MacOS/$(APP)
-	@codesign --force --sign - $(BUNDLE) 2>/dev/null || true
+	@codesign --force --sign "$(SIGN_ID)" $(BUNDLE) 2>/dev/null || true
 
 # 直接跑 bundle 里的可执行文件——日志会打到终端，方便调试。
 # 仍然在 bundle 内，所以 Info.plist（LSUIElement 等）照常生效。

@@ -626,6 +626,30 @@ enum UIProbe {
         //（TCC 旧记录绑的 cdhash 对不上，2026-08-23 实测）。
         // 判据不只是 `.blocked`：这一态**同样一个 monitor 都不能装**，
         // 而且面板必须给得出 `.regrant`，否则用户卡在这里出不去。
+        // ③b **关掉再打开必须还能装回来。** 用户报「关一次音效再打开就要我重新
+        // 去系统设置授权」——`teardown()` 会 invalidate 掉 event tap，
+        // 如果重建有一次失败，`apply()` 就报 .blocked，而那一态的按钮会
+        // `tccutil reset` 掉一条**本来好好的**授权记录，用户就真得重授一遍了。
+        // 所以这一条连开关三轮，每一轮 tap 都必须重新建起来。
+        for round in 1...3 {
+            step("③b 关→开 第\(round)轮·关", enabled: false, atLaunch: true, granted: true,
+                 expect: .off, listening: false, engineRunning: false)
+            step("③b 关→开 第\(round)轮·开", enabled: true, atLaunch: true, granted: true,
+                 expect: .running, listening: true, engineRunning: true)
+        }
+
+        // ③c 授权有效、但 tap 建不起来（授权在本进程启动之后才生效的典型表现）。
+        // 判据是**给 `.needsRestart` 而不是 `.blocked`**：后者的按钮会
+        // `tccutil reset` 掉一条本来有效的记录，把用户推去系统设置白走一趟。
+        // 先关掉，把上一步留下的 tap 撤掉——`installMonitors()` 对已装的 tap
+        // 是幂等的（直接返回 true），不撤就根本走不到「建不起来」那一支。
+        step("③c 先关掉（为下一步清场）", enabled: false, atLaunch: true, granted: true,
+             expect: .off, listening: false, engineRunning: false)
+        KeySoundController.probeForceTapFailure = true
+        step("③c 授权有效但 tap 建不起来", enabled: true, atLaunch: true, granted: true,
+             expect: .needsRestart, listening: false, engineRunning: false)
+        KeySoundController.probeForceTapFailure = false
+
         step("⑥ 请求过仍未放行（旧记录失效）", enabled: true, atLaunch: false, granted: false,
              didRequest: true, expect: .blocked, listening: false, engineRunning: false)
         if controller.action != .regrant {
