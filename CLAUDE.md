@@ -110,7 +110,7 @@ xcrun --sdk macosx --show-sdk-version   # → 26.5
 
 | 卡点 | 影响 | 解法 |
 |---|---|---|
-| **未代码签名/公证** | 开机自启不可用；别人下载会被 Gatekeeper 拦；**每次构建都掉 TCC 授权** | 需要 Apple Developer ID（$99/年）。开发期可用 `bash tools/dev-signing-identity.sh` 建一张固定的自签名证书，指定要求就从 cdhash 变成 certificate leaf，重新编译不再掉授权（`app/Makefile` 自动检测，没建过就退回 ad-hoc） |
+| **未代码签名/公证** | 开机自启不可用；别人下载会被 Gatekeeper 拦；**发行包每次升级都掉用户的 TCC 授权**（开发机的构建已不掉，见右） | 需要 Apple Developer ID（$99/年）。开发期固定签名身份**本机已建好（2026-08-25）**：指定要求从 cdhash 变成 certificate root（自签证书叶即是根，不是 leaf），重新编译不再掉授权（`app/Makefile` 自动检测）。重建/换机时跑 `bash tools/dev-signing-identity.sh`——openssl 自签的证书**必须补信任设置**（`add-trusted-cert`，脚本第 3 步），否则身份是 CSSMERR_TP_NOT_TRUSTED，codesign 拒签且报错指向错误方向 |
 | **能耗未实测** | 唯一未覆盖的风险：60Hz 唤醒阻止 SoC 深度空闲 | 已用「空闲即停」硬需求结构性消除。方法见 `tools/TESTING.md` |
 | **macOS 14/15 外观是「能用」不是「做过」** | 2026-08-11 决定不为旧系统做外观。系统控件自动走旧绘制路径（免费），唯一的自定义玻璃有回退：选中格是着色底＋accent 描边，看得见但没设计过；也没有 14/15 的机器可实测 | 真要支持就得先有机器 |
 | **发行包是 arm64 单架构** | **Intel Mac 连启动都做不到**（不是外观问题）。而 2020 年前的 MacBook 全是 Intel 且全都有背光键盘，正是目标用户 | `lipo -create` 编 universal 只是一行，但 CoreBrightness 私有接口在 Intel 上是否存在**无机器可验**。README 已写明「Intel 机型无法启动」 |
@@ -840,6 +840,15 @@ breathe——于是「音乐律动」从上线到现在**从来没有过一次 `
 现在两边都走 `Core/EffectFactory.swift`，未知效果名直接报错退出，不再静默退回。
 同理，两个 Makefile 的 `CORE` 清单改成 `$(wildcard ../Core/*.swift)`：手写清单漏了
 app 那边是链接错误（响亮），漏了 tools 那边**不报错**，只是悄悄编了一组不同的文件。
+
+**macOS 自带的 bash 3.2 会把 `$VAR` 后面紧贴的全角字符吞进变量名。**（2026-08-25）
+`echo "「$CN」"` 在 `set -u` 下报 `CN�: unbound variable`——变量名解析把 `」` 的
+首字节当成了名字的一部分（最小复现：`/bin/bash -c 'set -u; CN=x; echo "「$CN」"'`）。
+本仓库的脚本里中文紧贴变量的写法到处都是，**一律写 `${VAR}`**。
+这个 bug 在 dev-signing-identity.sh 里藏到 2026-08-25 才炸，因为出事的分支
+（「已存在」早退、--remove）此前一次都没执行过——**分支没跑过 ≠ 分支是对的**。
+另外 `set -e` 下裸 `read` 在非 TTY 环境撞到 EOF 会让脚本无声退出、留下半成品状态，
+交互步骤前要 `[ -t 0 ]` 判断。
 
 ---
 
