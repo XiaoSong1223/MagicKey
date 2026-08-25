@@ -21,11 +21,48 @@ import AppKit
 ///
 /// 它对**所有**效果生效，不只音频律动。只在某个效果下启用，会让
 /// 「为什么放着歌呼吸灯还是停了」变成将来一定有人来报的 bug。
+/// 引擎为什么不该跑。
+///
+/// **存在的唯一理由是「瞬时命令该不该丢弃」**：`magickey flash` 要能穿透
+/// 「用户离开了 120 秒」（人可能就坐在旁边，只是没敲键盘），但**不该**穿透
+/// 锁屏和息屏（闪给谁看？还会把已经睡下的 SoC 叫醒）。
+///
+/// 那两种情况在 `reason` 字符串里长得很像（「用户空闲 120s」/「锁屏」），
+/// 而**绝不能靠匹配那个字符串来区分**——它是给人看的日志文本，
+/// 改一个字就会静默错判，而且错的那一侧是「锁着屏还在闪」，没人会发现。
+/// 优先级由 `IdleMonitor.pauseCause` 里的判断顺序定死，从强到弱：
+/// **`displayUnavailable` > `lowPower` > `userIdle`**。三者可以同时成立
+/// （比如空闲久了自动锁屏、又开着低电量），这时必须报**最强**的那个，
+/// 否则 flash 会被一个较弱的原因放行。
+enum PauseCause: Equatable {
+    /// 屏幕或会话不可用：锁屏、息屏、系统睡眠、切换用户。
+    /// **最强**——什么都看不见，任何视觉反馈都是纯浪费。
+    case displayUnavailable
+    /// 用户开着「低电量模式」。
+    ///
+    /// 语义是「用户**明确要求**这台机器省电」，不是「电量低」——刻意不去读电量
+    /// 百分比（那个留给将来的规则引擎）。排在 `userIdle` 前面，因为它是一条
+    /// 明示指令，而 `userIdle` 只是「用户不在」的一个推断代理。
+    ///
+    /// **音频不抵消这一条。** 「有声音在放」是用来推翻 `userIdle` 那个推断的
+    /// （人戴着耳机听歌不碰键鼠是常态），而低电量模式是用户自己按下去的开关——
+    /// 放着音乐不代表他愿意让键盘背光继续耗电。
+    case lowPower
+    /// 用户长时间没有输入。**最弱**，只是一个推断；键盘还亮着、人可能就在旁边，
+    /// 所以瞬时闪光在这一态下是**放行**的。
+    case userIdle
+}
+
 @MainActor
 final class IdleMonitor {
 
-    /// 参数为「现在是否应该运行」。同一状态不会重复回调。
-    var onChange: ((Bool, String) -> Void)?
+    /// 参数为「现在是否应该运行」「不该跑的话是因为什么」「给人看的原因」。
+    /// 同一状态不会重复回调。
+    ///
+    /// ⚠️ 去重要看 **(能不能跑, 原因)** 这一对，不能只看第一个 Bool：
+    /// 「空闲 120 秒」之后再「锁屏」，前者已经是「不该跑」，只看 Bool 就不会
+    /// 再通知，于是引擎一直以为原因是 `.userIdle`——锁着屏 flash 照闪。
+    var onChange: ((Bool, PauseCause?, String) -> Void)?
 
     private var systemAsleep = false
     private var screensAsleep = false
@@ -40,10 +77,14 @@ final class IdleMonitor {
     private var userIdle = false
     private var audioPlaying = false
 
+    /// 用户开着「低电量模式」。事件驱动（`NSProcessInfoPowerStateDidChange`），
+    /// 零轮询、零权限。见 `PauseCause.lowPower`。
+    private var lowPower = false
+
     private var idleTimer: Timer?
     private var pollInterval: TimeInterval = 0
     private var observers: [NSObjectProtocol] = []
-    private var lastReported: Bool?
+    private var lastReported: (run: Bool, cause: PauseCause?)?
 
     /// 用户无输入多久算空闲
     var idleThreshold: TimeInterval = 120 {
@@ -85,20 +126,67 @@ final class IdleMonitor {
         observeDistributed("com.apple.screenIsLocked")   { self.screenLocked = true;  self.publish("锁屏") }
         observeDistributed("com.apple.screenIsUnlocked") { self.screenLocked = false; self.publish("解锁") }
 
+        // 低电量模式。**事件驱动，不轮询**——系统会在用户拨开关时主动通知。
+        //
+        // ⚠️ 文档不保证这个通知在主线程投递。`observe` 里的 `queue: .main`
+        // 就是那道保险：它保证回调落在主线程，`MainActor.assumeIsolated` 才成立。
+        // 换成 `queue: nil` 图省事的话，会在电源状态变化时从随机线程去改
+        // `lowPower` 并触发 `onChange` → 一路捅进 `Engine`。
+        observe(NotificationCenter.default, .NSProcessInfoPowerStateDidChange) {
+            self.refreshLowPower()
+        }
+        lowPower = Self.lowPowerNow()
+
         schedulePoll(Self.activeInterval)
 
         publish("启动")
+    }
+
+    /// 电源状态变了，重新看一眼。同一状态不会重复 publish。
+    private func refreshLowPower() {
+        let now = Self.lowPowerNow()
+        guard lowPower != now else { return }
+        lowPower = now
+        // 文案直接进 `conditionsReason`，面板上显示成「已暂停 · 低电量模式」——
+        // 不需要为它单独开一条展示路径。
+        publish(now ? "低电量模式" : "已退出低电量模式")
+    }
+
+    private static func lowPowerNow() -> Bool {
+        #if UI_PROBE
+        if let forced = probeLowPowerOverride { return forced }
+        #endif
+        return ProcessInfo.processInfo.isLowPowerModeEnabled
     }
 
     func stop() {
         idleTimer?.invalidate()
         idleTimer = nil
         pollInterval = 0
+        // 三个中心各是独立实例（`NSWorkspace` 的、分布式的、`.default`），
+        // token 不带来源，所以三个都摘一遍。摘错中心是无害的 no-op，
+        // **漏一个才是真的漏**——低电量那条挂在 `.default` 上。
         let ws = NSWorkspace.shared.notificationCenter
         let dc = DistributedNotificationCenter.default()
-        for o in observers { ws.removeObserver(o); dc.removeObserver(o) }
+        for o in observers {
+            ws.removeObserver(o)
+            dc.removeObserver(o)
+            NotificationCenter.default.removeObserver(o)
+        }
         observers.removeAll()
     }
+
+    #if UI_PROBE
+    /// **只在 UI 探针里编译。** 覆盖「用户开没开低电量模式」。
+    ///
+    /// 非有不可：低电量是系统全局开关，探针不能替用户去拨它（那会真的改机器设置），
+    /// 而不能注入就只剩「在开发机上手动拨一次再跑」——那不是回归测试。
+    /// 和 `KeySoundController.probeAccessOverride` 是同一套路子。
+    nonisolated(unsafe) static var probeLowPowerOverride: Bool?
+
+    /// 注入之后叫一下，模拟系统投递 `NSProcessInfoPowerStateDidChange`
+    func probeRefreshLowPower() { refreshLowPower() }
+    #endif
 
     // 轮询间隔。用高频轮询判断「是否空闲」本身就自相矛盾，所以活跃时 5 秒一次；
     // 但已经判定空闲后要反过来——那时轮询决定的是「多久才恢复」。
@@ -170,15 +258,29 @@ final class IdleMonitor {
     // 音频只抵消 `userIdle` 这一项，故意**不**参与前三项：睡眠 / 息屏 / 锁屏
     // 是「用户不在看键盘」的直接证据，而锁屏后继续放歌恰恰是最常见的情形。
     // 想让音乐把锁屏时的灯也点亮，方向就反了。
-    private var shouldRun: Bool {
-        !systemAsleep && !screensAsleep && !screenLocked
-            && !(enabled && userIdle && !audioPlaying)
+    //
+    // 顺序有意义：屏幕不可用优先于用户空闲。两者可以同时成立（空闲久了自动锁屏），
+    // 而这时该报的是**更强的那个约束**——否则 flash 会在锁屏后仍被放行。
+    // **这个 if 链的顺序就是 `PauseCause` 的优先级定义**，改顺序等于改语义。
+    // 三者可以同时成立（空闲久了自动锁屏、还开着低电量），必须报最强的那个：
+    // 报弱的会让 flash 被放行，而「锁着屏还在闪」没有任何用户会来报。
+    private var pauseCause: PauseCause? {
+        if systemAsleep || screensAsleep || screenLocked { return .displayUnavailable }
+        // 低电量在空闲之前：它是用户明示的指令，而空闲只是一个推断代理。
+        // 也**不受音频抵消**——放着音乐不代表他愿意让背光继续耗电。
+        if lowPower { return .lowPower }
+        if enabled && userIdle && !audioPlaying { return .userIdle }
+        return nil
     }
 
+    private var shouldRun: Bool { pauseCause == nil }
+
     private func publish(_ reason: String) {
+        let cause = pauseCause
         let now = shouldRun
-        guard now != lastReported else { return }
-        lastReported = now
-        onChange?(now, reason)
+        // 去重看 (能不能跑, 原因) 这一对，理由见 `onChange`
+        guard lastReported?.run != now || lastReported?.cause != cause else { return }
+        lastReported = (now, cause)
+        onChange?(now, cause, reason)
     }
 }

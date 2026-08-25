@@ -1,0 +1,112 @@
+#!/bin/bash
+#
+# MagicKey CLI —— 把命令翻译成 magickey:// URL 交给 LaunchServices。
+#
+# 为什么第一版是 shell 而不是编译出来的二进制：这一层**没有任何逻辑**，
+# 只是拼一个 URL。真正的解析和执行在 app 里（Sources/URLCommand.swift），
+# 那边有回归测试。为拼字符串编一个 Swift 二进制、再操心它装到哪、
+# 怎么签名、怎么随 app 更新，是纯亏。
+#
+# 已知的代价，别当成 bug：
+#   - `open` 是**异步**的，拿不到退出码。`magickey flash && echo done` 里的
+#     第二段会立刻跑，不会等闪完。对「构建完成闪一下」这个主用途无所谓，
+#     真需要同步语义时再考虑编二进制。
+#   - app 没在跑时，`open` 会先把它启动起来再送 URL（冷启动路径 app 侧有缓冲）。
+#
+# 安装：把这个文件放进 PATH，例如
+#   ln -s "$PWD/scripts/magickey" /usr/local/bin/magickey
+
+set -euo pipefail
+
+SCHEME="magickey"
+PROG="$(basename "$0")"
+
+usage() {
+	cat <<EOF
+${PROG} —— 从命令行和脚本里驱动 MacBook 键盘背光
+
+用法
+  ${PROG} flash [--times N]     闪 N 下（默认 3，范围 1–10）
+  ${PROG} on                    打开背光效果（等同面板上的总开关）
+  ${PROG} off                   关闭
+  ${PROG} effect <名字>         切换效果
+  ${PROG} --help                本帮助
+
+效果名
+  static    常亮        breathe    呼吸
+  heartbeat 心跳        strobe     频闪
+  keypulse  按键脉冲    audiobeat  音乐律动
+
+例子
+  npm run build && ${PROG} flash          构建完成闪一下
+  make test || ${PROG} flash --times 5    失败时闪得急一点
+  ${PROG} effect breathe && ${PROG} on    切到呼吸并打开
+
+  # 长任务跑完提醒（不用一直盯着终端）
+  ./deploy.sh; ${PROG} flash --times 3
+
+说明
+  flash 会临时借走背光，闪完立刻还原——总开关关着、或者效果因为你离开
+  而自动停了，它照样闪得出来。锁屏、息屏、睡眠时会**静默丢弃**（闪给谁看）。
+
+  on / off / effect 写的是和面板同一份设置，会被记住。
+  flash 是一次性的，不改变任何设置。
+EOF
+}
+
+# LaunchServices 送 URL。-g 不抢前台：脚本跑在后台时不该把窗口焦点抢走。
+send() {
+	if ! open -g "$1" 2>/dev/null; then
+		echo "${PROG}: 送不出去，MagicKey 可能没装（找不到 ${SCHEME}:// 的处理者）" >&2
+		echo "${PROG}: 试试先打开一次 /Applications/MagicKey.app 让系统登记它" >&2
+		exit 1
+	fi
+}
+
+[ $# -eq 0 ] && { usage; exit 0; }
+
+case "$1" in
+	flash)
+		shift
+		times=""
+		while [ $# -gt 0 ]; do
+			case "$1" in
+				--times)
+					shift
+					[ $# -gt 0 ] || { echo "${PROG}: --times 后面要跟一个数字" >&2; exit 2; }
+					times="$1"
+					;;
+				--times=*) times="${1#--times=}" ;;
+				*) echo "${PROG}: flash 不认识参数 $1" >&2; exit 2 ;;
+			esac
+			shift
+		done
+		# 次数由 app 侧校验和钳位（非数字按默认、超范围钳进 1–10），
+		# 这里不重复一份规则——两份校验一定会漂。
+		if [ -n "$times" ]; then
+			send "${SCHEME}://flash?times=${times}"
+		else
+			send "${SCHEME}://flash"
+		fi
+		;;
+
+	on|off)
+		send "${SCHEME}://$1"
+		;;
+
+	effect)
+		shift
+		[ $# -gt 0 ] || { echo "${PROG}: effect 后面要跟效果名（见 --help）" >&2; exit 2; }
+		send "${SCHEME}://effect/$1"
+		;;
+
+	-h|--help|help)
+		usage
+		;;
+
+	*)
+		echo "${PROG}: 不认识的命令 '$1'" >&2
+		echo "${PROG}: 可用 flash / on / off / effect，详见 ${PROG} --help" >&2
+		exit 2
+		;;
+esac

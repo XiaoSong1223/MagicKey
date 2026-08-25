@@ -15,6 +15,12 @@ enum Main {
 
     static func main() {
         let app = NSApplication.shared
+
+        // **必须在 `AppDelegate()` 之前。** `Engine()` 是它的存储属性，
+        // 构造时就会跑 `recoverFromPreviousCrashIfNeeded()`——那会把**正在运行的
+        // 那个实例**的崩溃快照还原掉并删除文件。晚一行都来不及，理由见 `AppInstance`。
+        if AppInstance.anotherIsRunning() { exit(0) }
+
         let d = MainActor.assumeIsolated { AppDelegate() }
         delegate = d
         app.delegate = d
@@ -46,19 +52,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
     private var panelHost: (any PanelSizeSyncing)?
     private var statusImages: [Bool: NSImage] = [:]
 
-    /// 统一日志出口。**不能用 NSLog**：它的动态内容（%@ 那部分）在统一日志里
-    /// 被标成 <private>，`log stream/show` 按内容过滤一条都查不到（2026-08-23 实测，
-    /// 连 "[keysound]" 都搜不出来），装好的 app 等于没有日志。
-    /// `Logger` + `privacy: .public` 才是可查的：
-    ///   log stream --predicate 'subsystem == "io.github.xiaosong1223.MagicKey"'
-    private static let logger = os.Logger(
-        subsystem: Bundle.main.bundleIdentifier ?? "io.github.xiaosong1223.MagicKey",
-        category: "app")
-
     override init() {
         // 必须在 Engine() 之前——引擎构造时就会做崩溃恢复并输出日志，
         // 放到 applicationDidFinishLaunching 里就晚了，那几行会漏掉。
-        Log.sink = { Self.logger.notice("\($0, privacy: .public)") }
+        //
+        // logger 本体在 `AppInstance`：单实例检查比这里还早（`Main.main` 里，
+        // `AppDelegate()` 之前），它的日志也得有地方去，一个应用留一个 logger。
+        Log.sink = { AppInstance.logger.notice("\($0, privacy: .public)") }
         settings = Settings()
         engine = Engine()
         super.init()
@@ -69,8 +69,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
         installMainMenu()
         setUpMenuBar()
 
-        idle.onChange = { [weak self] ok, reason in
-            self?.engine.setConditions(ok: ok, reason: reason)
+        idle.onChange = { [weak self] ok, cause, reason in
+            self?.engine.setConditions(ok: ok, cause: cause, reason: reason)
         }
         idle.enabled = settings.stopWhenIdle
         idle.idleThreshold = settings.idleSeconds
@@ -97,6 +97,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, Obs
             }
         )
         syncFromSettings()
+
+        // 引擎已经就绪，可以放行 URL 了。见 `pendingURLs`。
+        launched = true
+        let queued = pendingURLs
+        pendingURLs.removeAll()
+        for url in queued { handle(url) }
+    }
+
+    // MARK: - URL Scheme
+
+    /// 冷启动时收到但还没处理的 URL。
+    ///
+    /// **非有不可**：`open magickey://flash` 在 app 没跑的时候会先把 app 启动起来，
+    /// 而 AppKit 派发 `application(_:open:)` 的时机**早于**
+    /// `applicationDidFinishLaunching`。那时 `engine.apply(settings)` 还没跑过，
+    /// `makeEffect` 是 nil、`userWants` 还是 false、IdleMonitor 一次条件都还没报——
+    /// 直接执行的话 flash 会落进一个「什么都还没定」的引擎里。
+    ///
+    /// 缓存到 `didFinishLaunching` 末尾再重放，代价是几十毫秒，换来的是
+    /// 「冷启动和热启动走同一条路」。
+    private var pendingURLs: [URL] = []
+    private var launched = false
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard launched else {
+            pendingURLs.append(contentsOf: urls)
+            return
+        }
+        for url in urls { handle(url) }
+    }
+
+    /// 执行一条 URL 命令。
+    ///
+    /// **解析在 `URLCommand.parse`，这里只负责动手**——分开是为了让解析
+    /// 变成可回归的纯函数，见那边的类型注释。
+    private func handle(_ url: URL) {
+        guard let cmd = URLCommand.parse(url) else {
+            // 看不懂就记一条然后算了。**不弹窗**：脚本里打错一个字
+            // 不该在用户屏幕上糊一个对话框，而他多半也不在电脑前。
+            Log.write("[url] 无法理解，已忽略：\(url.absoluteString)")
+            return
+        }
+        Log.write("[url] \(url.absoluteString) → \(cmd.summary)")
+        switch cmd {
+        case .flash(let times):
+            // flash 是唯一不落 Settings 的动词：它是**一次性的**，
+            // 不该被持久化，也不该改变用户下次打开面板时看到的任何东西。
+            engine.flash(times: times)
+        case .setEnabled(let on):
+            settings.enabled = on
+        case .setEffect(let kind):
+            settings.kind = kind
+            // 只切效果不等于打开。用户 `magickey effect breathe` 多半是想看到它，
+            // 但替他打开总开关是越权——面板上点一格也不会自动开机。
+        }
     }
 
     // MARK: - 主菜单

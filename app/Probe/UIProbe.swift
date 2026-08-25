@@ -1542,6 +1542,539 @@ enum UIProbe {
         return out
     }
 
+    // MARK: - 引擎收敛
+
+    /// 「设置变了 → 该不该重建渲染状态」这条链路的回归。
+    ///
+    /// ## 为什么这一组非有不可
+    ///
+    /// `AppDelegate` 订阅的是 `settings.objectWillChange`，**任何**一个
+    /// `@Published` 属性变化都会走到 `Engine.apply`。而 `apply` 收的是
+    /// `Settings` 这个引用对象，此前没有任何办法判断「这次变的是不是我关心的」，
+    /// 于是每次都 `installState()`——新建 `RenderState`，`startedAt` 归零。
+    ///
+    /// 用户看见的是：**拖一下键盘音效的音量滑块，正在跑的呼吸跳到最暗重新开始。**
+    ///
+    /// 这个 bug 能活这么久，是因为它落在所有已有检查的缝里：面板探针只量尺寸，
+    /// `--analyze` 只跑纯效果函数，而 `isRunning` / `status` / `phase` 在
+    /// 「本来就在跑、参数变了」这一支里**一个字都不变**——从外面看，
+    /// 改音量和改效果长得完全一样。判据只能是 `probeInstallCount`。
+    ///
+    /// **阴性对照是这一组的一半**：光证明「改音量不重建」毫无意义，
+    /// 一个永远返回「没重建」的实现同样能通过。所以每一条「不该重建」的旁边
+    /// 都必须有一条「必须重建」，证明这个探针**分得出**两者。
+    static func engineConvergenceChecks() -> [String] {
+        print("\n── 引擎收敛（设置变化 → 渲染状态重建）──")
+        var failures: [String] = []
+
+        let settings = Settings()
+        let engine = Engine(probe: .running)
+
+        // 跑完要放回去：这个 Settings 和面板那个是同一个 UserDefaults 域，
+        // 留下的值会成为下一次探针运行的起点。
+        let saved = (enabled: settings.enabled, kind: settings.kind,
+                     period: settings.period, lo: settings.lo, hi: settings.hi,
+                     powerSaver: settings.powerSaver,
+                     volume: settings.keySoundVolume, pack: settings.keySoundPack,
+                     custom: settings.keySoundCustomEnabled,
+                     autoUpdate: settings.autoCheckUpdates,
+                     sensitivity: settings.sensitivity)
+        defer {
+            settings.enabled = saved.enabled
+            settings.kind = saved.kind
+            settings.period = saved.period
+            settings.lo = saved.lo
+            settings.hi = saved.hi
+            settings.powerSaver = saved.powerSaver
+            settings.keySoundVolume = saved.volume
+            settings.keySoundPack = saved.pack
+            settings.keySoundCustomEnabled = saved.custom
+            settings.autoCheckUpdates = saved.autoUpdate
+            settings.sensitivity = saved.sensitivity
+        }
+
+        // 起点。**总开关必须开着**：关着的话 `reconcile` 走的是「已停止」那一支，
+        // 根本不会 `installState`，整组就变成一串没有意义的假绿。
+        // 效果固定在 breathe——audiobeat 的 `makeEffect` 会把音频采集拉起来，
+        // 一个量尺寸的探针不该去开系统录音。
+        settings.enabled = true
+        settings.kind = .breathe
+        settings.period = 4.0
+        engine.apply(settings)
+
+        guard engine.probeInstallCount > 0, engine.probeStartedAt != nil else {
+            print("  ❌ 起点就没有渲染状态，后面每一条判据都无意义")
+            return ["引擎收敛探针：apply 之后没有渲染状态（起点不成立）"]
+        }
+
+        func check(_ tag: String, expectRebuild: Bool, _ mutate: () -> Void) {
+            let beforeCount = engine.probeInstallCount
+            let beforeStart = engine.probeStartedAt
+            mutate()
+            engine.apply(settings)
+            let rebuilt = engine.probeInstallCount > beforeCount
+            let phaseReset = engine.probeStartedAt != beforeStart
+            // 两个量必须同步：重建就该归零，没重建就该纹丝不动。
+            // 只对一个不算过——那说明机制和症状对不上，比直接报错更值得查。
+            let ok = rebuilt == expectRebuild && phaseReset == expectRebuild
+            print(String(format: "  %@  重建=%@ 相位归零=%@  %@",
+                         tag as NSString,
+                         (rebuilt ? "是" : "否") as NSString,
+                         (phaseReset ? "是" : "否") as NSString,
+                         (ok ? "✅" : "❌") as NSString))
+            if !ok {
+                failures.append("引擎收敛「\(tag.trimmingCharacters(in: .whitespaces))」："
+                                + "期望\(expectRebuild ? "重建" : "不重建")，"
+                                + "实测 重建=\(rebuilt) 相位归零=\(phaseReset)")
+            }
+        }
+
+        // ── 阴性对照：这些**必须**重建，否则改了效果没反应 ──
+        print("  · 阴性对照（改渲染参数 → 必须重建）")
+        check("换效果 kind         ", expectRebuild: true) { settings.kind = .heartbeat }
+        check("改周期 period       ", expectRebuild: true) { settings.period = 2.0 }
+        check("改亮度 hi           ", expectRebuild: true) { settings.hi = 0.7 }
+        check("改静息 lo           ", expectRebuild: true) { settings.lo = 0.2 }
+        check("省电模式 powerSaver ", expectRebuild: true) { settings.powerSaver = true }
+
+        // 总开关是**另一种**转移，判据也不一样：关掉走的是 `stopLoop`
+        // （把 state 置 nil = 拆掉），不是「重建」。
+        //
+        // 这一条不是凑数，它盯的是一个比呼吸抖一下严重得多的失效：
+        // `enabled` 要是漏出了 `RenderInputs`，`apply` 会在开关变化时直接早退，
+        // **总开关彻底失灵、点了毫无反应**，而上面那些 check 一条都不会红。
+        settings.enabled = false
+        engine.apply(settings)
+        let torn = engine.probeStartedAt == nil && !engine.isRunning
+        print(String(format: "  总开关 关 → 渲染状态 %@，isRunning=%@  %@",
+                     (engine.probeStartedAt == nil ? "已拆掉" : "还在") as NSString,
+                     (engine.isRunning ? "true" : "false") as NSString,
+                     (torn ? "✅" : "❌") as NSString))
+        if !torn { failures.append("引擎收敛：关掉总开关后引擎没有停（enabled 可能漏出了 RenderInputs）") }
+
+        settings.enabled = true
+        engine.apply(settings)
+        // ⚠️ 这里的判据**只能是 `isRunning`/`phase`，不能是渲染状态**。
+        // `Engine(probe:)` 刻意不建 driver 和 StateGuard（那会碰真实硬件，
+        // 还会清掉正在运行的那个 MagicKey 的崩溃恢复标记），而 `startLoop()`
+        // 第一行就是 `guard let driver, let guardian else { return }`——
+        // 探针里它必然早退，`installState()` 走不到。
+        //
+        // 那不是产品 bug，是这个 harness 的边界。**所以只断言探针真的看得见的东西**：
+        // 开关能不能双向穿过 `apply` 的变化检测。渲染状态那一半只打印不判定——
+        // 一个查不到东西的检查报通过，比没有这个检查更糟（本文件已经栽过一次）。
+        let reopened = engine.isRunning && engine.phase == .running
+        print(String(format: "  总开关 开 → isRunning=%@ phase=%@  %@（渲染状态：%@，探针无 driver，信息性）",
+                     (engine.isRunning ? "true" : "false") as NSString,
+                     "\(engine.phase)" as NSString,
+                     (reopened ? "✅" : "❌") as NSString,
+                     (engine.probeStartedAt == nil ? "未重建" : "已重建") as NSString))
+        if !reopened { failures.append("引擎收敛：重新打开总开关后引擎没有回到运行态（总开关失灵）") }
+
+        // ── 正题：这些和背光毫无关系，**一个字节都不该碰** ──
+        print("  · 无关属性（不该碰渲染状态）")
+        check("音效音量 volume     ", expectRebuild: false) { settings.keySoundVolume = 0.3 }
+        check("音色包 pack         ", expectRebuild: false) {
+            let other = KeySoundPack.all.first { $0.id != settings.keySoundPack }
+            settings.keySoundPack = other?.id ?? settings.keySoundPack
+        }
+        check("自定义音总开关      ", expectRebuild: false) {
+            settings.keySoundCustomEnabled.toggle()
+        }
+        check("自动检查更新        ", expectRebuild: false) {
+            settings.autoCheckUpdates.toggle()
+        }
+        // 灵敏度是这里面最要紧的一条：它**直推已经在跑的检测器**（见 Settings 的
+        // didSet），重建效果只会白白丢掉 `PulseEffect.live` 里正在衰减的脉冲——
+        // 亮着的光会在半途断掉。那条注释写了很久，一直被全量重建架空。
+        check("音乐灵敏度          ", expectRebuild: false) { settings.sensitivity = 1.55 }
+        // 幂等：什么都没改，再 apply 一次也不该重建
+        check("重复 apply（幂等）  ", expectRebuild: false) { }
+
+        // ── 用户报的那个症状：连续拖滑块 ──
+        // 单次不重建还不够。音量滑块是二十档吸附的，拖过去就是十几次 apply；
+        // 只要有一次漏网，用户看到的就是呼吸抖了一下。
+        let beforeCount = engine.probeInstallCount
+        let beforeStart = engine.probeStartedAt
+        for i in 0..<20 {
+            settings.keySoundVolume = Double(i) * 0.05
+            engine.apply(settings)
+        }
+        let dragOK = engine.probeInstallCount == beforeCount
+            && engine.probeStartedAt == beforeStart
+        print(String(format: "  · 连拖音量滑块 20 次  重建 %d 次  %@",
+                     engine.probeInstallCount - beforeCount,
+                     (dragOK ? "✅ 相位一纳秒未动" : "❌ 呼吸会抖") as NSString))
+        if !dragOK {
+            failures.append("引擎收敛：连续 20 次音量变化触发了 "
+                            + "\(engine.probeInstallCount - beforeCount) 次渲染状态重建")
+        }
+
+        return failures
+    }
+
+    // MARK: - URL 命令解析
+
+    /// `magickey://` 的解析回归。
+    ///
+    /// 这一组能存在，全靠 `URLCommand.parse` 是个**纯函数**。要是解析和执行
+    /// 揉在 `AppDelegate` 里，验「`times=abc` 会不会闪 0 下」就得真起一个 app、
+    /// 发一个 Apple Event、再想办法观察背光——没人会写那种测试。
+    ///
+    /// **阴性对照就是那一串 nil**：一个「什么都认得」的解析器同样能让
+    /// 上半截全绿，只有下半截能证明它真的会拒绝。
+    static func urlCommandChecks() -> [String] {
+        print("\n── URL 命令解析 ──")
+        var failures: [String] = []
+
+        func check(_ raw: String, _ expected: URLCommand?) {
+            guard let url = URL(string: raw) else {
+                print("  \(raw)  ❌ 连 URL 都构造不出来")
+                failures.append("URL 命令「\(raw)」构造失败")
+                return
+            }
+            let got = URLCommand.parse(url)
+            let ok = got == expected
+            let shown = got.map(\.summary) ?? "拒绝"
+            print(String(format: "  %-34@ → %-16@ %@",
+                         raw as NSString, shown as NSString,
+                         (ok ? "✅" : "❌ 期望 \(expected.map(\.summary) ?? "拒绝")") as NSString))
+            if !ok {
+                failures.append("URL 命令「\(raw)」解析成 \(shown)，"
+                                + "期望 \(expected.map(\.summary) ?? "拒绝")")
+            }
+        }
+
+        print("  · 三个动词")
+        check("magickey://flash", .flash(times: 3))
+        check("magickey://flash?times=5", .flash(times: 5))
+        check("magickey://on", .setEnabled(true))
+        check("magickey://off", .setEnabled(false))
+        check("magickey://effect/breathe", .setEffect(.breathe))
+        check("magickey://effect/audiobeat", .setEffect(.audioBeat))
+
+        print("  · 边界与容错")
+        // 不是数字 → 按缺省（脚本里变量没展开是最常见的情形）
+        check("magickey://flash?times=abc", .flash(times: 3))
+        check("magickey://flash?times=", .flash(times: 3))
+        // 是数字但超范围 → 钳住（他确实想表达次数，只是给大了）
+        check("magickey://flash?times=0", .flash(times: 1))
+        check("magickey://flash?times=999", .flash(times: 10))
+        check("magickey://flash?times=-4", .flash(times: 1))
+        check("magickey://flash?times=%205%20", .flash(times: 5))   // 带空格
+        // 大小写不该卡人
+        check("MAGICKEY://FLASH", .flash(times: 3))
+        check("magickey://effect/BREATHE", .setEffect(.breathe))
+        // 无关查询参数不影响
+        check("magickey://flash?foo=bar&times=2", .flash(times: 2))
+
+        print("  · 阴性对照（必须拒绝）")
+        check("magickey://", nil)
+        check("magickey://bogus", nil)
+        check("magickey://effect", nil)               // 少了 kind
+        check("magickey://effect/nosuch", nil)        // kind 不存在
+        check("magickey://effect/", nil)
+        check("https://flash", nil)                   // scheme 不对
+        check("notmagickey://flash", nil)
+        check("magickey://ON/extra/junk", .setEnabled(true))  // 多余路径不影响动词
+
+        return failures
+    }
+
+    // MARK: - 瞬时层
+
+    /// flash 的包络、叠加语义、自动出栈，以及「设置变更时 flash 不被吞掉」。
+    ///
+    /// 前半截直接搭 `EffectStack` 逐帧推，不经过 `Engine`——那是纯计算，
+    /// 跑得快、完全确定，而且**测得到输出曲线本身**。
+    /// 后半截才上 `Engine`，验的是重建时的重挂。
+    static func transientChecks() -> [String] {
+        print("\n── 瞬时层（flash）──")
+        var failures: [String] = []
+
+        func note(_ tag: String, _ ok: Bool, _ detail: String) {
+            print(String(format: "  %-30@ %@  %@", tag as NSString,
+                         detail as NSString, (ok ? "✅" : "❌") as NSString))
+            if !ok { failures.append("瞬时层「\(tag)」：\(detail)") }
+        }
+
+        // ── ① 叠加语义：底色必须活着，峰值必须压得住底色 ──
+        // 这一条盯的是 blend。协议默认是 `.replace`，那会让呼吸在 flash
+        // 期间整个消失 0.76 秒——而「有东西在闪」这个现象本身不会变，
+        // 光看键盘很难发现底色没了。
+        let fps = 60.0
+        let flash = FlashEffect(times: 3)
+        let stack = EffectStack(base: BreatheEffect(period: 4, min: 0.05, max: 0.85))
+        let bare = BreatheEffect(period: 4, min: 0.05, max: 0.85)
+
+        stack.push(flash)
+        var peak: Float = 0
+        var everBelowBase = false
+        var maxBaseGap: Float = 0
+        // **只喂到 duration 之前**：多喂一帧 flash 就返回 nil 被摘掉了，
+        // 下面「播完前还在栈上」那一条会验到一个已经出栈的状态。
+        // （第一版就是这么写的，探针当场报红——留着这行注释省下下一次。）
+        let frames = Int((flash.duration - 1 / fps) * fps)
+        for i in 0...frames {
+            let t = Double(i) / fps
+            let ctx = FrameContext(time: t, frame: UInt64(i), base: 0.85)
+            let mixed = stack.render(ctx)
+            let baseOnly = bare.tick(ctx) ?? 0
+            peak = Swift.max(peak, mixed)
+            // `.max` 的硬性后果：叠加结果**永远不低于底色**。低了就是被 replace 了。
+            if mixed < baseOnly - 0.0005 { everBelowBase = true }
+            maxBaseGap = Swift.max(maxBaseGap, mixed - baseOnly)
+        }
+        note("① 底色没被盖掉", !everBelowBase,
+             everBelowBase ? "有帧低于纯底色 → blend 可能退回了 .replace" : "全程 ≥ 纯底色")
+        note("① 峰值压得住底色", peak > 0.99,
+             String(format: "峰值 %.3f（底色上限 0.85）", peak))
+        note("① 确实叠上去了", maxBaseGap > 0.1,
+             String(format: "最大高出底色 %.3f", maxBaseGap))
+
+        // ── ② 播完自动出栈 ──
+        // 从曲线上看不出来：播完之后输出**本来就**该等于底色。只能直接数。
+        note("② 播完前还在栈上", stack.transientCount == 1,
+             "transientCount=\(stack.transientCount)")
+        let after = FrameContext(time: flash.duration + 0.5, frame: 9999, base: 0.85)
+        let mixedAfter = stack.render(after)
+        let baseAfter = bare.tick(after) ?? 0
+        note("② 播完自动出栈", stack.transientCount == 0,
+             "transientCount=\(stack.transientCount)")
+        note("② 出栈后输出回到底色", abs(mixedAfter - baseAfter) < 0.0005,
+             String(format: "%.4f vs 底色 %.4f", mixedAfter, baseAfter))
+
+        // ── ③ 底色相位没被打断 ──
+        // flash 是叠加层，不该让呼吸「跳一下」。判据：同一时刻，
+        // 叠加过 flash 的栈和一个从没被打扰过的 breathe 必须给出同一个相位。
+        let probeT = FrameContext(time: 2.34, frame: 140, base: 0.85)
+        let s2 = EffectStack(base: BreatheEffect(period: 4, min: 0.05, max: 0.85))
+        let phaseOK = abs(s2.render(probeT) - (bare.tick(probeT) ?? 0)) < 0.0005
+        note("③ 底色相位未被打断", phaseOK, phaseOK ? "相位一致" : "相位漂了")
+
+        // ── ④ 时间基准跳回 0 时不重播、不早退 ──
+        // 这是 `installState()` 重建渲染状态时真实发生的事：`ctx.time` 从 0 重新起算。
+        // `FlashEffect` 用增量累加自愈，代价是丢一帧；直接吃 ctx.time 会整个重播。
+        let rebased = FlashEffect(times: 3)
+        var fed = 0.0
+        // 先正常喂到一半
+        while fed < rebased.duration / 2 {
+            _ = rebased.tick(FrameContext(time: fed, frame: 0, base: 0.85))
+            fed += 1 / fps
+        }
+        // 时间基准换掉：从 0 重新喂，喂**剩下的那一半**的时长
+        var fed2 = 0.0
+        var endedEarly = false
+        var ticks = 0
+        while fed2 < rebased.duration / 2 + 0.2 {
+            if rebased.tick(FrameContext(time: fed2, frame: 0, base: 0.85)) == nil {
+                endedEarly = fed2 < rebased.duration / 2 - 0.1
+                break
+            }
+            ticks += 1
+            fed2 += 1 / fps
+        }
+        note("④ 时间基准跳回 0 后自愈", !endedEarly && ticks > 0,
+             endedEarly ? "提前结束了（可能直接吃了 ctx.time）"
+                        : "继续播了 \(ticks) 帧后正常结束")
+
+        // ── ⑤ 设置变更时 flash 存活（走真的 Engine）──
+        let settings = Settings()
+        let engine = Engine(probe: .running)
+        let savedEnabled = settings.enabled
+        let savedKind = settings.kind
+        let savedVolume = settings.keySoundVolume
+        defer {
+            settings.enabled = savedEnabled
+            settings.kind = savedKind
+            settings.keySoundVolume = savedVolume
+        }
+        settings.enabled = true
+        settings.kind = .breathe
+        engine.apply(settings)
+
+        engine.pushTransient(FlashEffect(times: 3))
+        note("⑤ push 之后挂上了", engine.probeTransientCount == 1,
+             "transientCount=\(engine.probeTransientCount)")
+
+        // 无关属性变化：阶段 1 的变化检测应该让它连重建都不会发生
+        settings.keySoundVolume = 0.42
+        engine.apply(settings)
+        note("⑤ 改无关设置后仍在", engine.probeTransientCount == 1,
+             "transientCount=\(engine.probeTransientCount)")
+
+        // 相关属性变化：**会**重建渲染状态，flash 必须被重新挂上去
+        let beforeInstall = engine.probeInstallCount
+        settings.kind = .heartbeat
+        engine.apply(settings)
+        let rebuilt = engine.probeInstallCount > beforeInstall
+        note("⑤ 换效果确实重建了（对照）", rebuilt,
+             "installCount \(beforeInstall) → \(engine.probeInstallCount)")
+        note("⑤ 重建后 flash 被重挂", engine.probeTransientCount == 1,
+             "transientCount=\(engine.probeTransientCount)")
+
+        // ── ⑥ 三种引擎状态下 flash 的去向 ──
+        //
+        // 判据落在 `flashDisposition` 这个纯决策上，而不是「真的去闪一下再看键盘」。
+        // 最要紧的是「锁屏必须丢弃」那一条：错的那一侧是**锁着屏还在闪**，
+        // 而没有任何用户会来报这个 bug——只能靠回归守住。
+        print("  · flash 三态决策")
+        func disposition(_ tag: String, _ expected: Engine.FlashDisposition,
+                         _ prep: () -> Void) {
+            prep()
+            let got = engine.flashDisposition
+            let ok = got == expected
+            print(String(format: "    %-28@ → %-22@ %@", tag as NSString,
+                         "\(got)" as NSString, (ok ? "✅" : "❌ 期望 \(expected)") as NSString))
+            if !ok { failures.append("flash 三态「\(tag)」：得到 \(got)，期望 \(expected)") }
+        }
+
+        disposition("a. 引擎在渲染", .overlay) {
+            engine.setConditions(ok: true, cause: nil, reason: "探针")
+            settings.enabled = true
+            engine.apply(settings)
+        }
+        disposition("b. 总开关关掉", .takeover) {
+            settings.enabled = false
+            engine.apply(settings)
+        }
+        disposition("b. 空闲停表（人可能在旁边）", .takeover) {
+            settings.enabled = true
+            engine.apply(settings)
+            engine.setConditions(ok: false, cause: .userIdle, reason: "用户空闲 120s")
+        }
+        disposition("c. 锁屏 → 丢弃", .discard("屏幕不可用（锁屏）")) {
+            engine.setConditions(ok: false, cause: .displayUnavailable, reason: "锁屏")
+        }
+        // 阴性对照：从锁屏回到空闲，必须重新放行——不然「解锁之后再也闪不出来」
+        disposition("解锁回到空闲（阴性对照）", .takeover) {
+            engine.setConditions(ok: false, cause: .userIdle, reason: "用户空闲 120s")
+        }
+        // 换一个**原因**再进 displayUnavailable，顺带验「原因确实会更新」。
+        //
+        // ⚠️ 这一步必须从别的 cause 进来。停在 displayUnavailable 里直接换 reason
+        // 是**不会**更新的（去重看的是 (能不能跑, 原因) 这一对，reason 只是标签），
+        // 那是有意的：同一个 cause 内换文案不值得让引擎重新收敛一次，
+        // 而且此时「锁屏」和「系统睡眠」同时为真，先到的那个仍然是准确的。
+        // 第一版探针在这里断言了完整字符串，当场报红——留着这段省下下一次。
+        disposition("c. 空闲→系统睡眠 → 丢弃", .discard("屏幕不可用（系统睡眠）")) {
+            engine.setConditions(ok: false, cause: .displayUnavailable, reason: "系统睡眠")
+        }
+        disposition("c. 低电量模式 → 丢弃", .discard("低电量模式")) {
+            engine.setConditions(ok: false, cause: .lowPower, reason: "低电量模式")
+        }
+        // 阴性对照：退出低电量必须重新放行，否则「关掉低电量之后再也闪不出来」
+        disposition("退出低电量（阴性对照）", .overlay) {
+            settings.enabled = true
+            engine.apply(settings)
+            engine.setConditions(ok: true, cause: nil, reason: "已退出低电量模式")
+        }
+
+        // ── ⑦ 追加 flash 不能截断前一个 ──
+        //
+        // 前一个 ×10（2.72s）还剩两秒时追加一个 ×1（0.2s）：交还时刻必须仍然按
+        // **最晚**那个算。按「刚追加的那个的时长」算的话交还会提前到 0.25s，
+        // 前一个被拦腰截断——真机上表现为「连发两次 flash，第一次没闪完就断了」，
+        // 而单发怎么测都是对的。
+        //
+        // 真接管要驱动，探针里跑不起来；但交还时刻这个**计算**测得到，
+        // 而 bug 恰好整个落在这个计算上。
+        print("  · 追加 flash 的交还时刻")
+        engine.setConditions(ok: true, cause: nil, reason: "探针")
+        settings.enabled = true
+        engine.apply(settings)
+
+        let long = FlashEffect(times: 10)
+        engine.pushTransient(long)
+        guard let afterLong = engine.probeTakeoverDeadline else {
+            failures.append("追加 flash：push 之后拿不到交还时刻")
+            return failures
+        }
+        engine.pushTransient(FlashEffect(times: 1))
+        let afterShort = engine.probeTakeoverDeadline
+        let notTruncated = afterShort.map { $0 >= afterLong.addingTimeInterval(-0.001) } ?? false
+        let shortEnds = Date().addingTimeInterval(FlashEffect(times: 1).duration)
+        print(String(format: "    ×10(%.2fs) 后追加 ×1(%.2fs) → 交还仍在 %+.2fs 处（短的那个只到 %+.2fs）  %@",
+                     long.duration, FlashEffect(times: 1).duration,
+                     afterShort?.timeIntervalSinceNow ?? -1,
+                     shortEnds.timeIntervalSinceNow,
+                     (notTruncated ? "✅ 没被截断" : "❌ 被短的那个截断了") as NSString))
+        if !notTruncated {
+            failures.append("追加 flash：交还时刻被短的那个拉早了（前一个会被拦腰截断）")
+        }
+
+        return failures
+    }
+
+    // MARK: - 低电量
+
+    /// 低电量模式 → 引擎暂停，以及它和别的暂停原因的优先级。
+    ///
+    /// 走**真的** `IdleMonitor`（真装通知、真跑 `pauseCause` 那条 if 链），
+    /// 只把「用户开没开低电量」这一个系统全局开关注入掉——探针不能替用户
+    /// 去拨那个开关，那会真的改机器设置。
+    static func lowPowerChecks() -> [String] {
+        print("\n── 低电量模式 ──")
+        var failures: [String] = []
+
+        let idle = IdleMonitor()
+        var last: (run: Bool, cause: PauseCause?, reason: String)?
+        idle.onChange = { ok, cause, reason in last = (ok, cause, reason) }
+
+        // 空闲检测关掉：`userIdle` 取决于探针跑的时候机器空闲了多久、
+        // 有没有音频在放，那两个都不可控。这一组要验的是低电量，别让它变成薛定谔的。
+        idle.enabled = false
+        IdleMonitor.probeLowPowerOverride = false
+        idle.start()
+        defer {
+            idle.stop()
+            IdleMonitor.probeLowPowerOverride = nil
+        }
+
+        func check(_ tag: String, run: Bool, cause: PauseCause?) {
+            let got = last
+            let ok = got?.run == run && got?.cause == cause
+            print(String(format: "  %-26@ 该跑=%@ 原因=%-20@ %@",
+                         tag as NSString,
+                         (got?.run == true ? "是" : "否") as NSString,
+                         "\(got?.cause.map { "\($0)" } ?? "—")" as NSString,
+                         (ok ? "✅" : "❌ 期望 该跑=\(run) 原因=\(cause.map { "\($0)" } ?? "—")") as NSString))
+            if !ok {
+                failures.append("低电量「\(tag)」：得到 该跑=\(got?.run.description ?? "nil") "
+                                + "原因=\(got?.cause.map { "\($0)" } ?? "—")，"
+                                + "期望 该跑=\(run) 原因=\(cause.map { "\($0)" } ?? "—")")
+            }
+        }
+
+        check("起点（未开低电量）", run: true, cause: nil)
+
+        IdleMonitor.probeLowPowerOverride = true
+        idle.probeRefreshLowPower()
+        check("开启低电量 → 暂停", run: false, cause: .lowPower)
+        let reasonOK = last?.reason == "低电量模式"
+        print("  暂停原因文案 = 「\(last?.reason ?? "—")」  "
+              + (reasonOK ? "✅ 面板会显示「已暂停 · 低电量模式」" : "❌"))
+        if !reasonOK { failures.append("低电量：暂停原因文案不是「低电量模式」") }
+
+        // 优先级：屏幕不可用 > 低电量。两者同时成立时必须报前者——
+        // 报后者的话 `flashDisposition` 的文案会说「低电量」，而真实约束是屏幕黑着。
+        // 这里直接往 NSWorkspace 的通知中心投一条真事件，走的是产品代码那条路。
+        NSWorkspace.shared.notificationCenter.post(
+            name: NSWorkspace.screensDidSleepNotification, object: nil)
+        check("低电量 + 息屏 → 报息屏", run: false, cause: .displayUnavailable)
+
+        NSWorkspace.shared.notificationCenter.post(
+            name: NSWorkspace.screensDidWakeNotification, object: nil)
+        check("屏幕醒了 → 回到低电量", run: false, cause: .lowPower)
+
+        // 阴性对照：关掉低电量必须恢复。一个「永远报暂停」的实现同样能让上面全绿。
+        IdleMonitor.probeLowPowerOverride = false
+        idle.probeRefreshLowPower()
+        check("退出低电量 → 恢复（对照）", run: true, cause: nil)
+
+        return failures
+    }
+
     // MARK: - 跑
 
     static func run() {
@@ -1727,6 +2260,10 @@ enum UIProbe {
         // ── 7. 面板落点与设置窗口位置 ──────────────────────────────
         // 放在最后：settingsCenterChecks 会把 activationPolicy 切成 .regular，
         // 别让它影响前面那些尺寸测量。
+        failures += engineConvergenceChecks()
+        failures += urlCommandChecks()
+        failures += transientChecks()
+        failures += lowPowerChecks()
         failures += keySoundPackInventoryChecks()
         failures += keySoundChecks(settings: settings)
         failures += keySoundRenderChecks()
