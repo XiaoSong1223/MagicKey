@@ -221,7 +221,7 @@ struct BacklightSnapshot: Codable {
 - [x] 开机自启（`SMAppService`，未签名时会失败并如实提示）
 - [x] 省电模式：30Hz
 - [x] 「空闲即停」：锁屏 / 息屏 / 切换用户 / 用户长时间无输入
-- [ ] 低电量自动暂停
+- [x] 低电量自动暂停（`ProcessInfo.isLowPowerModeEnabled`，事件驱动零权限）
 - [ ] 缓动曲线与相位可调
 
 ### v0.2 — 交互反馈

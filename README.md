@@ -3,7 +3,7 @@
   <h1>MagicKey</h1>
   <p>让 MacBook 内置键盘背光随呼吸、敲击与音乐流动。</p>
   <p>
-    <img src="https://img.shields.io/badge/version-v2.0-B8D2FF?style=flat-square" alt="版本 v2.0">
+    <img src="https://img.shields.io/badge/version-v2.1-B8D2FF?style=flat-square" alt="版本 v2.1">
     <img src="https://img.shields.io/badge/macOS-14%2B-171A20?style=flat-square&logo=apple&logoColor=white" alt="macOS 14+">
     <img src="https://img.shields.io/badge/Apple%20Silicon-required-303640?style=flat-square&logo=apple&logoColor=white" alt="需要 Apple Silicon">
     <img src="https://img.shields.io/badge/Swift-5-F05138?style=flat-square&logo=swift&logoColor=white" alt="Swift 5">
@@ -161,10 +161,58 @@ make -C app uninstall
 - 默认以 60fps 渲染，也可切换到 30fps 低帧率模式
 - 睡眠、锁屏、息屏或切换用户时自动停止，恢复使用后自动继续
 - 默认在 120 秒无输入且没有音频播放时暂停，避免后台持续刷新
+- 开启系统「低电量模式」时自动暂停并交还键盘，关闭后自动恢复
 - 支持登录时自动启动；签名或安装位置不符合系统要求时会在界面中显示错误
 - 作为纯菜单栏应用运行，不占用 Dock 位置
 - 接管前保存亮度、环境光自动调节和闲置调暗设置，停止时按正确顺序恢复
 - 异常退出后在下次启动时检测残留快照并先行恢复
+
+### CLI / 脚本集成
+
+把触发权交给你自己的脚本。构建完成、测试跑完、部署结束——让键盘闪一下告诉你，
+不用一直盯着终端。
+
+```bash
+# 安装：把脚本链进 PATH
+ln -s "$PWD/scripts/magickey" /usr/local/bin/magickey
+```
+
+```bash
+magickey flash                  # 闪 3 下
+magickey flash --times 5        # 闪 5 下（范围 1–10）
+magickey on                     # 打开背光效果（等同面板上的总开关）
+magickey off                    # 关闭
+magickey effect breathe         # 切换效果
+magickey --help
+```
+
+真实用法：
+
+```bash
+npm run build && magickey flash             # 构建完成闪一下
+make test || magickey flash --times 5       # 失败时闪得急一点
+./deploy.sh; magickey flash --times 3       # 长任务跑完提醒
+
+# 也可以直接用 URL，不装脚本
+open -g "magickey://flash?times=3"
+```
+
+**`flash` 会临时借走背光，闪完立刻还原**——即使总开关关着，或者效果因为你离开
+而自动停了，它照样闪得出来。
+
+以下三种情况会静默丢弃（记一条日志，不报错）：
+
+- **锁屏、息屏、睡眠**：闪了也没人看得见，还会把已经进入低功耗的芯片叫醒
+- **低电量模式**：你刚刚明确要求这台机器省电，而 flash 恰恰要把停着的渲染循环拉起来
+
+`on` / `off` / `effect` 写的是和面板同一份设置，会被记住；`flash` 是一次性的，
+不改变任何设置。
+
+> 这条链路**不需要任何额外系统授权**：URL 交给 LaunchServices 转发，
+> MagicKey 不监听端口、不常驻 socket。
+>
+> `open` 是异步的，拿不到退出码——`magickey flash && echo done` 的第二段会立刻执行，
+> 不会等闪完。对上面这些用途没有影响。
 
 ### 菜单栏状态
 
@@ -202,6 +250,7 @@ MagicKey 面向 MacBook 内置键盘背光；外接键盘不在支持范围内�
 | 按键脉冲 | 不需要“输入监控” | 只读取全局按键事件计数与距最近事件的时间，不读取 keycode 或输入内容 |
 | 音乐律动 | 需要“系统录音”，不是“麦克风” | 音频仅在内存中换算为低频能量与鼓点事件，随即丢弃 |
 | 键盘敲击音效 | 需要“输入监控”，**默认关闭** | 只用 keycode 决定播哪一条采样（内置音色按空格/回车/退格/通用分类；自定义按键音按 keycode 逐键查表）；不读取字符内容，不记录、不保存、不上传任何按键内容。写入磁盘的只有你自己导入的音频文件和一张“哪个键指了哪条音色”的表 |
+| CLI / URL Scheme | 无额外权限 | 只接收 `magickey://` 命令，由 LaunchServices 转发；不监听端口、不常驻 socket、不接受远程输入 |
 | 更新检查 | 启动时访问一次 GitHub Releases API，之后最多每 24 小时一次 | User-Agent 只包含应用名和版本，不发送设备标识或使用数据 |
 
 MagicKey 不录音、不写入音频文件、不上传声音、不包含遥测，也不发送崩溃报告。关闭“自动检查更新”后不会再自动联网；用户主动点击“检查更新”时仍会访问 GitHub。
@@ -265,7 +314,8 @@ DESIGN.md   架构、硬件实测与设计约束
 
 ## Roadmap
 
-- CLI 与 URL Scheme 触发
+- 全局快捷键切换效果
+- 情境自动化（当前 App / 时间段 / 电量 → 自动切换效果）
 - Developer ID 签名、公证与稳定的发行包
 - 在真实设备与更多 macOS 版本上持续验证私有接口兼容性
 

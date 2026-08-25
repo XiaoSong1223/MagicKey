@@ -89,7 +89,11 @@ xcrun --sdk macosx --show-sdk-version   # → 26.5
 | 音乐律动七态 `AudioStatus` | ✅ 含「没声音在放」与推断的「未授权」+ 跳转 |
 | `mainMenu` / ⌘Q | ✅ 之前 ⌘Q 完全无效（从未设过 mainMenu） |
 | 面板打开即可操作（焦点） | ✅ 锚点改 `.nonactivatingPanel` 拉活应用，探针带阴性对照 |
-| UI 探针 `make probe-ui` | ✅ 高度/收缩/窄屏/五态/更新五态/面板落点/面板焦点/设置窗口居中/窗口 Space 标志/键盘图小面板锚点 |
+| UI 探针 `make probe-ui` | ✅ 高度/收缩/窄屏/五态/更新五态/面板落点/面板焦点/设置窗口居中/窗口 Space 标志/键盘图小面板锚点/**引擎收敛** |
+| 单实例保护 `AppInstance` | ✅ 两向实测：有实例在跑则退出并说明，无实例则正常启动 |
+| 瞬时层 `FlashEffect` + `Engine.flash` | ✅ 三态真机实测 + 人工验收通过（2026-08-25）：观感清晰可数、连发不截断、接管中锁屏/回来/强杀均正确交还还原。包络过 `--analyze`（最长停留 84.3ms） |
+| CLI + URL Scheme（`magickey://`） | ✅ `scripts/magickey` + 三个动词，零新增权限。冷启动送达实测通过，真机人工验收通过 |
+| 低电量自动暂停 `PauseCause.lowPower` | ✅ 探针注入验证（含优先级与阴性对照）+ 真机拨开关验收通过（2026-08-25）；「音频不抵消低电量」经用户确认 |
 | 状态还原 **六个时机** | ✅ 全部实测：正常退出、手动停止、崩溃重启、系统睡眠、SIGTERM、锁屏 |
 | 键盘敲击音效 `KeySound*`（需「输入监控」，默认关） | ✅ 真机验收通过。12 套内置音色（kbsim/MIT，响度对齐 −32dBFS）+ 抬起音 + 防机关枪抖动 |
 | 自定义按键音（音色库 + 77 键键盘图指键） | ✅ 真机验收通过。导入验证/响度双向对齐/删音色连带清指键；按下自定义>音色包、抬起归包 |
@@ -125,7 +129,9 @@ xcrun --sdk macosx --show-sdk-version   # → 26.5
 
 ### v0.1 收尾
 
-- [ ] 低电量自动暂停
+- [x] ~~低电量自动暂停~~ 已实现。信号是 `ProcessInfo.isLowPowerModeEnabled` +
+      `NSProcessInfoPowerStateDidChange`（事件驱动、零轮询、零权限）。语义刻意是
+      「用户**开了**低电量模式」而不是「电量低」——不读电量百分比，那个留给 v0.4 规则引擎
 - [ ] 缓动曲线与相位可调
 - [x] ~~应用图标~~ 已有 `AppIcon.icns` 与状态栏专用图 `StatusKey{Active,Inactive}`
 - [ ] 代码签名 + 公证（**不能上 Mac App Store**，私有 API 违反 Review Guidelines 2.5.1）
@@ -146,10 +152,19 @@ xcrun --sdk macosx --show-sdk-version   # → 26.5
       `CGEventTap`（原先写 `NSEvent` 监听，那条路要的是**辅助功能**，见「踩过的坑」）——
       真要做黑名单时直接挂在 `KeySoundController.tapReceived` 上，
       对已为音效授权的用户权限成本为零。）
-- [ ] 按键脉冲叠加在呼吸底色上（`EffectStack` 的瞬时层就是为这个建的，至今没人调用 `push()`）
-- [ ] **CLI + URL Scheme** ← 这是最被低估的功能，见下方说明
-- [ ] 全局快捷键切换效果
-- [ ] 效果预设导入导出（JSON）
+- [x] ~~**CLI + URL Scheme**~~ 已实现（v2.1）：`magickey://flash?times=N` / `on` / `off`
+      / `effect/<kind>`，`scripts/magickey` 是个 shell 脚本包 `open -g`。零新增 TCC 权限
+- [x] ~~瞬时层真的有人调 `push()` 了~~ `Engine.pushTransient` + `FlashEffect`（blend `.max`）
+- [ ] **按键脉冲/音乐律动叠加在呼吸底色上** ← 机制已经全部就位（瞬时层、`.max` 混合、
+      重建后重挂都通了，flash 在用），**剩下的全是产品问题**：`EffectKind` 是六选一的单选，
+      而「呼吸 + 按键」是两个维度的乘积，塞不进那个 2×3 网格；周期参数也只有一个
+      （呼吸周期和脉冲时长会打架）。别再当成架构任务估工期
+- [ ] 全局快捷键切换效果（**走 Carbon `RegisterEventHotKey`，零 TCC**；
+      别蹭 `KeySoundController` 那个 `CGEventTap`，那会把「背光线零权限」打破。
+      真正的工作量是录快捷键的控件，SwiftUI 没有现成的）
+- [ ] 效果预设导入导出（JSON）——序列化不难，照抄 `CustomSoundStore` 那套
+      （版本号 + Codable + atomic 写）。难的是两处：`period` 的合法区间随 kind 变而
+      `kind.didSet` 只在 kind **变化**时钳；以及一次性写十几个属性会触发十几次收敛
 
 > **为什么 CLI 是核心而非附属**：没有任何干净的公开 API 能监听系统通知
 > （读 Notification Center 数据库要完全磁盘访问且随版本失效）。
@@ -181,12 +196,18 @@ xcrun --sdk macosx --show-sdk-version   # → 26.5
 
 ### 架构上的待办
 
-- [ ] **按键检测换成单调计数**：现在靠 `idle` 相对上一帧回落判断有没有新按键，
-      当重复间隔比帧长**稍短**时 `idle` 每帧递增，下降沿永不出现，按键全漏。
-      30fps 撞上系统最快重复率（33ms）正好踩中，实测 60 次只检出 1 次（`--analyze`
-      会打 `❌ 只检出 n/N`）。60fps 不受影响，所以默认配置安全，但省电模式是个洞。
-      修法：`CGEventSource.counterForEventType(.combinedSessionState, eventType: .keyDown)`
-      返回单调计数，同样免权限，能数出每帧几次按下；`idle` 继续用来取最近一次的亚帧时刻
+- [x] ~~**按键检测换成单调计数**~~ **v0.3 已完成**（`PulseSource` 那批提交），
+      本条 2026-08-25 才发现一直没划掉，白白让人重查了一轮。旧判据是「`idle` 相对上一帧
+      是否回落」，重复间隔比帧长稍短时该值每帧递增、下降沿永不出现，**按键整段漏掉**
+      （30fps 撞 33ms 重复率实测 60 次只检出 1 次）。现在 `drain()` 取的是
+      `counterForEventType` 的**计数增量**，语义上不可能漏。
+      **剩下的半条不是 bug，是权限的价钱**：一帧内按了 n 次仍然只发一个脉冲——
+      计数知道 n 是几，但 `secondsSinceLastEventType` 只给得出最近那一次的时刻，
+      中间几次按平均间隔铺开就是编数据。后果只剩「`KeyRepeatFilter` 在 30fps 下锁不上、
+      长按偏亮」，**不再是脉冲消失**（实测 33ms 重复率下 30fps 是 93→91 合并两次，
+      占空比 45.5% vs 60fps 的 43.4%，差别很小）。要彻底消掉就得拿到每次按下的时刻，
+      零权限 API 给不出来，只能上 `CGEventTap`（输入监控）——**那和「做不做键位黑名单」
+      是同一个决定**，别当成两件事各论证一遍
 - [ ] **帧率按效果推导**：慢速效果无需 60Hz。判据用最大相对步进，**上限锁 60Hz**（再高无收益）
 - [ ] `registerNotificationForKeys:` 监听用户按 F5/F6，作为「用户接管」信号（DESIGN.md F6，尚未实现）
 
@@ -194,13 +215,116 @@ xcrun --sdk macosx --show-sdk-version   # → 26.5
 
 ## 踩过的坑（别重复踩）
 
+**「安排下一次收尾」要按最晚的那个到期时刻算，不是按刚加进来的那个。**
+（2026-08-25，`appendToTakeover`）
+
+临时接管期间又来一发 flash 时，`scheduleTakeoverEnd(after: fx.duration)` 用的是
+**新**那个的时长。前一个 ×10（2.72s）还剩两秒时追加一个 ×1（0.2s），
+token 一作废旧安排，交还就提前到 0.25s——**前一个被拦腰截断，背光在闪光半途被还原**。
+
+难发现的地方在于**单发怎么测都是对的**，只有连发才复现，而连发时人眼看到的是
+「闪了几下然后停了」，很像是设计如此。现在按 `liveTransients` 里最晚的 `endsAt` 算。
+
+配套的不变量：**`liveTransients` 必须严格对应当前那个栈里挂着的东西**。
+`beginTakeover` 建的是全新的栈，所以它得先 `removeAll()` 再 `pushTransient`——
+不清的话之前登记过、但并不在这个新栈里的条目会把接管时长凭空拉长。
+
+**瞬时层的静息值是 0，不是 `lo`——和 `PulseEffect` 正好相反，别互相照抄。**
+（2026-08-25，`FlashEffect`）
+
+`Effect.blend` 的协议默认是 `.replace`。瞬时效果**必须自己覆写成 `.max`**，
+否则呼吸会在 flash 那 0.76 秒里整个消失再回来——而「有东西在闪」这个现象本身不变，
+光看键盘极难发现底色没了（探针的判据因此是「叠加结果永远 ≥ 纯底色」）。
+
+配套的一条：`.max` 之下，**静息时必须返回 0**，因为 `max(底色, 0) == 底色`
+＝「这一帧我不发言」。返回 `lo` 会给底色垫一个地板，把呼吸的波谷整个抬平。
+`PulseEffect` 收敛回 `lo` 是**对的**——它是基础层，`lo` 就是它自己的静息亮度。
+两个结论都对，前提不同，抄错方向就是一个很难看出来的 bug。
+
+**瞬时效果不能直接吃 `ctx.time`，因为渲染状态会在它播到一半时被重建。**
+
+`ctx.time` 是「距 `RenderState.startedAt` 多久」，而用户可能在 flash 播到一半时
+改个设置——`installState()` 一重建，`ctx.time` 就跳回 0。直接用它的话 flash
+要么从头重播、要么当场判定为已结束。`FlashEffect` 改成**累加增量**
+（`elapsed += max(0, ctx.time - lastTick)`），负增量视为基准换了、跳过那一帧。
+代价是丢 16.7ms，换来「flash 是一条命令，不是一段时间函数」。
+
+同一件事在 `Engine` 那边的对应物：`installState()` 要把没播完的瞬时效果**重新挂上去**。
+主线程只存一个到期时刻，**绝不问效果「你播完了吗」**——那是渲染队列独占的状态，
+隔着线程问就是数据竞争。所以 `TransientEffect` 协议里只有一个不可变的 `duration`。
+
+**「用户离开了」和「屏幕锁着」必须结构化区分，不能从 reason 字符串反推。**
+
+`flash` 要穿透「120 秒没敲键盘」（人可能就坐在旁边），但**不该**穿透锁屏/息屏。
+这两种在 `reason` 里长得很像（「用户空闲 120s」/「锁屏」），拿字符串匹配去分
+是在赌那行文案永远不改——而且赌输的那一侧是「锁着屏还在闪」，**没有人会来报这个 bug**。
+现在走 `PauseCause` 枚举。
+
+两个配套的去重都得跟着改成看 **(能不能跑, 原因)** 这一对，只看 Bool 会漏：
+「空闲 120s」之后再「锁屏」，前者已经是「不该跑」，Bool 没变 → 不通知 →
+引擎的原因一直停在 `.userIdle` → 锁屏后 flash 照闪。`IdleMonitor.publish` 和
+`Engine.setConditions` 两处都有这个坑，改一处等于没改。
+
+**临时接管必须在 `guardian.capture()` 之前交还，否则会把闪光半途的亮度当成用户的原始状态。**
+
+`Engine.flash` 在引擎停着时会临时借走背光（`capture` → 只跑瞬时层 → `restore`）。
+三个地方必须调 `endTakeover`：引擎要启动了（`startLoop`）、屏幕不可用了
+（`setConditions`）、进程要退出了（`shutdown`）。**最难看的是第一个**——
+`startLoop` 会 `capture()`，此时若还借着背光，存进崩溃快照的就是闪到一半的那个亮度，
+之后引擎停下来还会把键盘"还原"成它。
+
+顺带：接管期间崩溃是**安全**的，`capture()` 一落盘磁盘上就是 flash 之前的原始状态，
+和引擎正常运行时崩溃走同一条恢复路径。
+
+**订阅 `objectWillChange` 等于订阅「随便什么变了」，而引擎照单全收就会重启动画。**
+（2026-08-25，v2.1 阶段 1 修掉）
+
+现象：**拖一下键盘音效的音量滑块，正在跑的呼吸会跳到最暗重新开始。** 音色包、
+自动检查更新、自定义音总开关三个开关同样如此——它们和背光没有半点关系。
+
+根因是一条谁看都合理的链：`AppDelegate` 订阅 `settings.objectWillChange`（**任何**
+`@Published` 属性都会触发）→ `engine.apply(settings)` → `reconcile` 在「本来就在跑」
+那一支里 `installState()` → 新建 `RenderState`，而它的 `startedAt = Date()` 就是相位基准。
+`apply` 收的是 `Settings` **引用对象**，没有值语义，所以它此前根本没有办法判断
+「这次变的是不是我关心的东西」。修法是让 `Settings` 交出一个 `RenderInputs` 值快照
+（enabled/kind/period/lo/hi/fps），`apply` 比一下没变就直接返回。
+
+**为什么它活了这么久**：`isRunning` / `status` / `phase` 在这一支里**一个字都不变**，
+从外面看「改音量」和「改效果」完全一样。面板探针只量尺寸、`--analyze` 只跑纯效果函数，
+整条 `Engine` 收敛逻辑此前**零覆盖**。判据只能是「渲染状态重建了几次」，
+所以探针里加了 `probeInstallCount`。**加新设置项时先问一句：它会改变 `makeEffect()`
+的产物或帧率吗？不会就别往 `RenderInputs` 里加**，加了等于把这个 bug 再引入一次。
+
+顺带一提，`sensitivity` 的注释写着「直推检测器，不重建效果、不重建 tap」——
+tap 确实没重建，但**效果一直在被重建**，正在衰减的脉冲被从中间切断。
+注释描述的是意图，不是当时的行为；这种「注释是对的、代码把它架空了」最难看出来。
+
+**第二个实例不是「多开一个窗口」，是把第一个实例的还原数据删掉。**（2026-08-25）
+
+两样东西是**全机唯一**而不是进程内唯一：键盘那个全局亮度寄存器（`Driver` 的串行队列
+只保证进程内单一写入者），以及 `~/Library/Application Support/MagicKey/app-snapshot.json`
+（`StateGuard` 的 namespace 恒为 "app"，两个实例用**同一个文件**）。
+
+真正的损坏在第二样：后启动的那个在 `Engine.init` 里就跑 `recoverFromPreviousCrashIfNeeded()`，
+它看见磁盘上有快照 → 断定「上次没干净退出」→ 把系统还原成那份快照**并删掉文件**。
+而那份快照属于**正在正常运行的第一个实例**，此后它退出时无文件可依，
+用户的原始亮度和环境光设置就永久丢了。
+
+所以检查必须在 `AppDelegate()` **之前**（`Engine()` 是它的存储属性，
+构造函数体还没开始跑，破坏就已经发生了），这也是它待在 `Main.main()` 里的唯一理由。
+实际撞得到的路径不是「用户双击两次」（LaunchServices 会拦），而是
+**`/Applications` 那份开着、同时在源码树里 `make run`**——`make install` 里有
+`pkill -x MagicKey`，所以这条路径一直没暴露过。
+
 **监听按键不需要输入监控权限。** 本文件曾写着 KeyPulse「需输入监控权限，必须做成可选」——
 这是**错的**，白白把一个功能推迟了一个版本。`CGEventSource.secondsSinceLastEventType(
 .combinedSessionState, eventType: .keyDown)` 是公开 API，返回「距上次按键多少秒」，
 不弹授权框，实测 p99 0.04µs（60fps 下占帧预算 0.0002%）。IdleMonitor 早就在用同一个调用。
 代价是拿不到「按了哪个键」——而硬件只有一路全局亮度，这个信息本来也用不上。
-判断按键的方法是逐帧比较该值是否**回落**；用 `ctx.time - idle` 而不是 `ctx.time`
-记录按下时刻，上升沿起点才是亚帧精度的（实测采样峰值 0.844 vs 量化到帧边界的 0.815）。
+用 `ctx.time - idle` 而不是 `ctx.time` 记录按下时刻，上升沿起点才是亚帧精度的
+（实测采样峰值 0.844 vs 量化到帧边界的 0.815）。
+（**判断「有没有新按键」现在用的是 `counterForEventType` 单调计数，不是「该值是否回落」**——
+回落判据已经废弃，理由见「架构上的待办」第一条。同一个免权限调用族，别搞混。）
 
 **自动重复会把 keypulse 钉在峰值，根因不是「哪个键」。** 按住任意键，内核按
 83.6ms（本机实测，=5 个 1/60s tick）重复投递 keyDown，而脉冲默认 0.4s、
@@ -707,6 +831,15 @@ launch 快照同理要 `setProbeLaunchAccess` 可注入。
 
 **分析工具不要写成独立脚本。** 必须复用 `Core/` 里真正的 `Effect` 和 `Perceptual`，
 否则改了曲线忘了改脚本，分析结果就开始骗人。这是 `--analyze` 做进二进制的唯一理由。
+
+**——而「复用 `Effect`」还不够，「参数怎么变成 `Effect`」那一层也必须共用。**
+（2026-08-25 发现）上一版确实复用了 `Effect`，但 app 和工具各有一个 `makeEffect` switch，
+**漂移正好发生在那一层**：工具那份压根没有 `audiobeat` 分支，未知名字一律静默退回
+breathe——于是「音乐律动」从上线到现在**从来没有过一次 `--analyze`**，
+谁也不知道它在 255 档地板上是什么样子（补测后是过的，最长单档停留 9.3ms）。
+现在两边都走 `Core/EffectFactory.swift`，未知效果名直接报错退出，不再静默退回。
+同理，两个 Makefile 的 `CORE` 清单改成 `$(wildcard ../Core/*.swift)`：手写清单漏了
+app 那边是链接错误（响亮），漏了 tools 那边**不报错**，只是悄悄编了一组不同的文件。
 
 ---
 
