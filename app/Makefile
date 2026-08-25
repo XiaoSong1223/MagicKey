@@ -9,8 +9,11 @@ APP     := MagicKey
 BUNDLE  := $(APP).app
 CONTENTS:= $(BUNDLE)/Contents
 
-CORE    := ../Core/Log.swift ../Core/Driver.swift ../Core/StateGuard.swift ../Core/Effects.swift \
-           ../Core/PulseSource.swift ../Core/AudioActivity.swift ../Core/AudioTap.swift ../Core/OnsetDetector.swift ../Core/BeatPulseSource.swift
+# **整目录取，别逐个列。** 这份清单以前在 app/Makefile 和 tools/Makefile 里
+# 各写一份，加一个 Core 文件要同时改两处。漏了 app 那边是链接错误（响亮），
+# 漏了 tools 那边**不报错**——只要新文件没被引用就照编不误，于是 `--analyze`
+# 会在分析一个和 app 不同的效果集合。「分析工具开始骗人」是这个项目最贵的坑之一。
+CORE    := $(wildcard ../Core/*.swift)
 SOURCES := $(CORE) $(wildcard Sources/*.swift)
 RESOURCES := Resources/AppIcon.icns \
              Resources/StatusKeyActive.png Resources/StatusKeyActive@2x.png \

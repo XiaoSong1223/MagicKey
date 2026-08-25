@@ -135,10 +135,12 @@ enum Analyzer {
         // 「点亮占空比」＝窗口内亮度高于静息 10% 的时间比例。
         //
         // 加这一列是为了回答一个最大相对步进答不了的问题：**判定器有没有锁上**。
-        // 按键检测是逐帧比对、一帧只记一次（Effects.swift），30fps 帧长 33ms 而
-        // 重复间隔最快约 33ms——两次重复会落进同一帧，测出的间隔忽 33 忽 66，
-        // 规整度被采样破坏，长按就抑制不住。那种失效在这一列上是一眼的：
-        // 长按序列下占空比应该很低（只有开头那几下），失效则接近 100%。
+        // 脉冲源一帧只发一个 `Pulse`（`PulseSource.swift`：计数差知道这一帧按了几次，
+        // 但 `secondsSinceLastEventType` 只给得出最近那一次的时刻，中间几次无从得知）。
+        // 30fps 帧长 33ms 撞上最快 33ms 的重复率，两次重复就会落进同一帧被合并成一个，
+        // `KeyRepeatFilter` 看到的间隔忽 33 忽 66，规整度被采样破坏，长按抑制不住。
+        // 那种失效在这一列上是一眼的：长按序列下占空比应该很低（只有开头那几下），
+        // 失效则接近 100%。
         let litThreshold = opts.lo + 0.1 * (opts.hi - opts.lo)
         print("\n   fps   最大相对步进   出现位置    点亮占空比   评价")
 
@@ -176,17 +178,28 @@ enum Analyzer {
                 }
             }
             let duty = total > 0 ? Double(lit) / Double(total) * 100 : 0
-            // 检出数（触发+抑制）少于序列长度 = 有按键根本没被看见。
+            // 检出数（触发+抑制）少于序列长度 = 有按键**和前一次合并**进了同一帧。
             //
-            // 这不是过滤器的问题，是检测本身的盲区：判据是 idle 相对上一帧回落，
-            // 而当重复间隔比帧长**稍短**时，idle 每帧递增（增量 = 帧长 − 间隔），
-            // 下降沿永远不出现。30fps + 33ms 重复率正好踩中，60 次只检出 1 次。
-            // 60fps 帧长 16.7ms 短于任何系统重复率，不受影响。
+            // ⚠️ 这不是「漏检」，那个 bug 已经修掉了（2026 v0.3，`PulseSource` 换成
+            // 单调计数）。旧判据是「idle 相对上一帧是否回落」，重复间隔比帧长稍短时
+            // 下降沿永不出现、事件**整段消失**（30fps + 33ms 实测 60 次只检出 1 次）。
+            // 现在 `drain()` 取的是计数增量，语义上不可能漏。
+            //
+            // 剩下的是另一件事：一帧内按了 n 次也只发一个 `Pulse`——计数知道 n 是几，
+            // 但 `secondsSinceLastEventType` 只给得出最近那一次的时刻，
+            // 中间几次按平均间隔铺开就是在编数据，不做（`PulseSource.swift`）。
+            // 后果只影响 `KeyRepeatFilter` 的节奏判定（间隔忽 1 帧忽 2 帧，锁不上，
+            // 长按仍偏亮），**不再是脉冲整段消失**。看占空比那一列判严重程度。
+            //
+            // 60fps 帧长 16.7ms 短于任何系统重复率，走不到这里，所以默认配置安全。
+            // 要彻底消掉就得拿到每次按下的时刻——零权限 API 给不出来，只能上
+            // `CGEventTap`（输入监控）。那和「做不做键位黑名单」是同一个决定，
+            // 见 CLAUDE.md。**别再当成待修的 bug 重查一遍。**
             let keys = (effect as? PulseEffect)?.repeatStats.map { s -> String in
                 let seen = s.accepted + s.suppressed
-                let miss = opts.sequenceCount > 0 && seen < opts.sequenceCount
-                    ? String(format: "  ❌ 只检出 %d/%d", seen, opts.sequenceCount) : ""
-                return String(format: "  %3d 触发 / %3d 抑制%@", s.accepted, s.suppressed, miss)
+                let merged = opts.sequenceCount > 0 && seen < opts.sequenceCount
+                    ? String(format: "  ⓘ 帧内合并 %d→%d", opts.sequenceCount, seen) : ""
+                return String(format: "  %3d 触发 / %3d 抑制%@", s.accepted, s.suppressed, merged)
             } ?? ""
             print(String(format: "  %4.0f      %6.1f %%      档%3d 跳%2d      %5.1f %%    %@%@",
                          fps, worstRel * 100, worstAt, worstJump, duty, verdict, keys))

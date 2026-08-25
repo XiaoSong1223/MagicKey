@@ -80,10 +80,16 @@ final class CoreBrightnessDriver: BacklightDriver {
     /// 上一次实际写入的 8bit 量化档位。-1 表示尚未写入。
     private var lastLevel: Int = -1
 
-    // 统计
+    // 统计。
+    //
+    // 这里以前还有一个 `writeLatencies: [Double]`，逐次追加、上限 30 万条
+    // （约 2.4MB 常驻），而唯一的读取者 `latencyStats()` **全仓库零调用**——
+    // 一个跑在发行版里、谁也看不到的缓冲。单次写入耗时早就实测定死了
+    // （avg 0.09ms / p99 0.24ms，记在 DESIGN.md F3），不需要常驻采样。
+    // 真要再量一次就照 `KeySoundPlayer` 那样滚动聚合（count/sum/max 攒一批打一行），
+    // 常数内存，别再开数组。
     private(set) var writeCount: UInt64 = 0
     private(set) var skipCount: UInt64 = 0
-    private(set) var writeLatencies: [Double] = []
 
     /// 返回 nil 表示当前系统上不可用（私有 API 变更或无内置键盘背光）。
     init?() {
@@ -146,14 +152,9 @@ final class CoreBrightnessDriver: BacklightDriver {
             return true
         }
 
-        let t0 = DispatchTime.now().uptimeNanoseconds
         let ok = client.setBrightness(Float(level) / 255.0, forKeyboard: keyboardID)
-        let dtMs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
-
         if ok { lastLevel = level }
         writeCount += 1
-        // 长时间运行下别让采样数组无限增长（30 分钟 60fps 上限约 10 万条）
-        if writeLatencies.count < 300_000 { writeLatencies.append(dtMs) }
         return ok
     }
 
@@ -185,17 +186,5 @@ final class CoreBrightnessDriver: BacklightDriver {
     var isAmbientAvailable: Bool {
         raw.responds(to: NSSelectorFromString("isAmbientFeatureAvailableOnKeyboard:"))
             ? client.isAmbientFeatureAvailable(onKeyboard: keyboardID) : false
-    }
-
-    // MARK: 统计输出
-
-    func latencyStats() -> (avg: Double, p50: Double, p99: Double, max: Double) {
-        guard !writeLatencies.isEmpty else { return (0, 0, 0, 0) }
-        let sorted = writeLatencies.sorted()
-        let avg = writeLatencies.reduce(0, +) / Double(writeLatencies.count)
-        return (avg,
-                sorted[sorted.count / 2],
-                sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.99))],
-                sorted[sorted.count - 1])
     }
 }

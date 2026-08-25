@@ -33,6 +33,9 @@ struct Options {
     /// 喂给 analyze 的合成按键序列。nil = 沿用「t=0 敲一次」的老输入。
     var sequence: String?
     var repeatFilter = true    // 关掉是为了真机 A/B 对比新旧行为
+
+    /// `--effect flash` 闪几下
+    var flashTimes = FlashEffect.defaultTimes
     var repeatInterval = PressSequence.Measured.interval
     var repeatJitter = PressSequence.Measured.jitter
 
@@ -71,6 +74,7 @@ func parseArgs() -> Options {
         case "--set":      o.mode = .set; o.setValue = Float(val()) ?? 0
         case "--probe":    o.mode = .probe
         case "--sequence": o.sequence = val()
+        case "--times":    o.flashTimes = Int(val()) ?? o.flashTimes
         case "--no-repeat-filter": o.repeatFilter = false
         case "--repeat-interval":  o.repeatInterval = (Double(val()) ?? 100) / 1000
         case "--repeat-jitter":    o.repeatJitter = (Double(val()) ?? 1) / 1000
@@ -99,20 +103,29 @@ func parseArgs() -> Options {
               --probe            测本机按键节奏，定 KeyRepeatFilter 的容差，不碰硬件
 
             选项
-              --effect <static|breathe|heartbeat|strobe|keypulse>   默认 breathe
+              --effect <static|breathe|heartbeat|strobe|keypulse|audiobeat|flash>
+                                 默认 breathe。未知名字直接报错，不会静默退回。
+                                 flash 是 CLI 的瞬时效果，面板上选不到它
+              --times  <1–10>    仅 flash：闪几下，默认 3。窗口自动取它的总时长
               --period <秒>      效果周期，默认 4.0
-                                 （keypulse 是单次脉冲总时长，默认 0.4）
-              --min    <0–1>     亮度下限，默认 0.05
-              --max    <0–1>     亮度上限，默认 0.85
+                                 （keypulse / audiobeat 是单次脉冲总时长，
+                                   不显式给时分别取 0.4 / 0.35）
+              --min    <0–1>     亮度下限，默认 0.05（脉冲类是「静息亮度」）
+              --max    <0–1>     亮度上限，默认 0.85（脉冲类是「脉冲峰值」）
               --fps    <帧率>    默认 60
               --gamma  <值>      感知映射，默认 1.0（关闭）
               --duration <秒>    预览/探针时长，0 = 直到 Ctrl-C
 
-            keypulse 专用
+            脉冲类效果（keypulse / audiobeat）
+              analyze 用确定性的合成脉冲，preview 用真来源——keypulse 读键盘
+              （零权限），audiobeat 接系统音频（需「系统录音」授权，且必须有声音在放）
+
               --sequence <autorepeat|typing>
                                  给 analyze 喂合成按键序列。不给则沿用「t=0 敲一次」，
-                                 那种输入验证不了任何跟节奏有关的东西
-              --no-repeat-filter 关掉自动重复过滤，用于真机 A/B 对比新旧行为
+                                 那种输入验证不了任何跟节奏有关的东西。
+                                 两条序列都是**按键**节奏，对 audiobeat 没有意义
+              --no-repeat-filter 关掉自动重复过滤，用于真机 A/B 对比新旧行为。
+                                 audiobeat 本来就是关的（鼓点就是等间隔，开着必哑）
               --repeat-interval <毫秒>   合成序列的重复间隔，默认按 --probe 实测
               --repeat-jitter   <毫秒>   合成序列的重复抖动，默认按 --probe 实测
             """)
@@ -162,8 +175,31 @@ if opts.mode == .probeAudio {
     exit(0)
 }
 
-// keypulse 的 --period 语义是「单次脉冲时长」，4 秒的默认值对它毫无意义
-if !opts.periodExplicit && opts.effect == "keypulse" { opts.period = 0.4 }
+// 效果名解析。**未知名字要报错，不能默默退回 breathe**——旧版就是那样，
+// 于是 `--effect audiobeat` 一直在分析呼吸曲线而没有任何人发现。
+//
+// `flash` 刻意**不在** `EffectKind` 里：那个枚举驱动面板上的 2×3 网格
+// （`EffectGrid` 遍历 `allCases`），把 flash 加进去会凭空多出一格用户选不了的效果。
+// 它是瞬时层，只由 CLI 触发。所以这里是「效果名」而不是「EffectKind」。
+enum ToolEffect {
+    case base(EffectKind)
+    case flash(times: Int)
+}
+
+let toolEffect: ToolEffect = {
+    if opts.effect == "flash" { return .flash(times: opts.flashTimes) }
+    guard let kind = EffectKind(rawValue: opts.effect) else {
+        let known = (EffectKind.allCases.map(\.rawValue) + ["flash"]).joined(separator: " / ")
+        FileHandle.standardError.write("未知效果: \(opts.effect)（可用 \(known)）\n".data(using: .utf8)!)
+        exit(2)
+    }
+    return .base(kind)
+}()
+
+// 脉冲类效果的 --period 语义是「单次脉冲时长」，4 秒的通用默认值对它们毫无意义
+if case .base(let kind) = toolEffect, !opts.periodExplicit, kind.isPulse {
+    opts.period = kind.defaultPeriod
+}
 
 // 合成按键序列。只对 analyze 有意义——preview 用的是真键盘。
 let pressTimes: [Double]? = { () -> [Double]? in
@@ -181,24 +217,43 @@ let pressTimes: [Double]? = { () -> [Double]? in
 
 // 分析窗口：周期性效果一个周期就够；喂了按键序列则要覆盖整条序列，
 // 末尾还要留出最后一次脉冲衰减完的时间，否则会把没播完的包络当成结尾。
-opts.window = pressTimes.map { ($0.last ?? 0) + opts.period + 0.5 } ?? opts.period
+//
+// flash 自己就有明确的总时长，窗口取它——**不能多给**：多出来的那一截
+// flash 已经返回 nil（出栈了），分析器会把它算成一段超长的尾部停留，
+// 报出一个不存在的「卡顿」。
+if case .flash(let n) = toolEffect {
+    opts.window = FlashEffect(times: n).duration
+    // 报告抬头那行「周期」对 flash 而言就是**一下的周期**（起手+衰减+暗场）。
+    // 留着 --period 的 4.0 默认值只会让人以为分析跑错了参数。
+    opts.period = FlashEffect.cycle
+} else {
+    opts.window = pressTimes.map { ($0.last ?? 0) + opts.period + 0.5 } ?? opts.period
+}
 opts.sequenceCount = pressTimes?.count ?? 0
 
+/// **实现在 `Core/EffectFactory.swift`，和 app 走同一份。**
+/// 这里以前是第二个 switch，和 `Settings.makeEffect()` 漂了——理由见工厂那个文件开头。
 func makeEffect(_ o: Options) -> Effect {
-    switch o.effect {
-    case "static":    return StaticEffect(level: o.hi)
-    case "heartbeat": return HeartbeatEffect(period: o.period, min: o.lo, max: o.hi)
-    case "strobe":    return StrobeEffect(period: o.period, min: o.lo, max: o.hi)
-    case "keypulse":
-        // preview 用真键盘；analyze 要确定性输入——给了序列就重放序列，
-        // 没给就退回老的「t=0 敲一次」
-        let source: PulseSource
-        if let times = pressTimes         { source = SyntheticPulseSource(times: times) }
-        else if o.mode == .analyze        { source = SyntheticPulseSource() }
-        else                              { source = KeyboardPulseSource() }
-        return PulseEffect(duration: o.period, min: o.lo, max: o.hi,
-                           source: source, filterRepeats: o.repeatFilter, name: "keypulse")
-    default:          return BreatheEffect(period: o.period, min: o.lo, max: o.hi)
+    switch toolEffect {
+    case .flash(let times):
+        // flash 的峰值恒为 1.0（见 FlashEffect），--min/--max 对它没有意义：
+        // 它是瞬时层，静息值必须是 0（= 这一帧不发言），不是 lo。
+        return FlashEffect(times: times)
+
+    case .base(let kind):
+        // preview 用真来源（键盘 / 系统音频）；analyze 要确定性输入——
+        // 给了序列就重放序列，没给就退回「t=0 敲一次」，那是包络曲线的回归基准输入。
+        let pulses: PulseSourcePolicy
+        if let times = pressTimes  { pulses = .synthetic(times: times) }
+        else if o.mode == .analyze { pulses = .synthetic(times: [0]) }
+        else                       { pulses = .live }
+
+        return EffectFactory.make(EffectSpec(
+            kind: kind, period: o.period, lo: o.lo, hi: o.hi,
+            pulses: pulses,
+            // nil = 按效果取默认（keypulse 开、audiobeat 必须关）。
+            // `--no-repeat-filter` 是真机 A/B 用的显式覆盖，只往 false 的方向压。
+            filterRepeats: o.repeatFilter ? nil : false))
     }
 }
 

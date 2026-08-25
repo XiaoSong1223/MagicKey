@@ -31,6 +31,19 @@ extension Effect {
     var motionIntent: MotionIntent { .smooth }
 }
 
+/// 瞬时效果：有明确的总时长，播完 `tick` 返回 nil 自动出栈。
+///
+/// **为什么协议里只要一个 `duration`，不要一个 `isFinished`。**
+/// 效果的进度状态（播到哪了）只有**渲染队列**能碰——`RenderState` 独占那一条
+/// 就是为了这个。`Engine` 却要在**主线程**上决定「渲染状态重建之后，
+/// 这个瞬时效果还要不要重新挂上去」。问效果「你播完了吗」是数据竞争；
+/// 问它「你一共多长」不是，因为那是构造时就定死的不可变量。
+///
+/// 于是主线程只记一个到期时刻，渲染队列只管播——两边不共享任何可变状态。
+protocol TransientEffect: Effect {
+    var duration: TimeInterval { get }
+}
+
 // MARK: - 感知映射
 //
 // 结论（已实测，2026-08-03）：**默认关闭（gamma=1.0）。Apple 的 0–1 很可能已做过感知映射。**
@@ -337,6 +350,11 @@ final class EffectStack {
 
     func setBase(_ effect: Effect) { base = effect }
     func push(_ effect: Effect) { transients.append(effect) }
+
+    /// 还有几个瞬时效果没播完。给探针当判据用——「播完自动出栈」这件事
+    /// 从输出曲线上看不出来（播完之后输出**本来就**该等于底色），
+    /// 只能直接数。
+    var transientCount: Int { transients.count }
 
     func render(_ ctx: FrameContext) -> Float {
         var value = base.tick(ctx) ?? ctx.base

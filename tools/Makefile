@@ -3,8 +3,9 @@
 # 不走 SwiftPM——见 ../app/Makefile 的说明。
 
 BIN     := magickey-tool
-CORE    := ../Core/Log.swift ../Core/Driver.swift ../Core/StateGuard.swift ../Core/Effects.swift \
-           ../Core/PulseSource.swift ../Core/AudioActivity.swift ../Core/AudioTap.swift ../Core/OnsetDetector.swift ../Core/BeatPulseSource.swift
+# 整目录取，理由见 ../app/Makefile 同一行——两边必须编**同一组** Core 文件，
+# 否则工具分析的效果集合会和 app 实际跑的悄悄分叉。
+CORE    := $(wildcard ../Core/*.swift)
 SOURCES := $(CORE) Sources/AudioProbe.swift Sources/Analyze.swift Sources/Sequences.swift Sources/Probe.swift Sources/main.swift
 SWIFTC  := swiftc
 FLAGS   := -O -swift-version 5 -framework Foundation -framework AppKit -framework AVFoundation

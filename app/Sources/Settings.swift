@@ -5,15 +5,11 @@ private extension Double {
     func clamped(_ lo: Double, _ hi: Double) -> Double { Swift.min(Swift.max(self, lo), hi) }
 }
 
-enum EffectKind: String, CaseIterable, Identifiable {
-    case staticLevel = "static"
-    case breathe
-    case heartbeat
-    case strobe
-    case keyPulse = "keypulse"
-    case audioBeat = "audiobeat"
-
-    var id: String { rawValue }
+/// `EffectKind` 的**界面那一半**。
+///
+/// 身份、周期区间、默认周期在 `Core/EffectFactory.swift`——那些是 `magickey-tool`
+/// 也要用的，而显示名和 SF Symbol 只有面板需要。Core 不该知道自己被谁用。
+extension EffectKind {
 
     var displayName: String {
         switch self {
@@ -37,38 +33,13 @@ enum EffectKind: String, CaseIterable, Identifiable {
         }
     }
 
-    /// 各效果合适的周期范围与默认值（秒）
-    var periodRange: ClosedRange<Double> {
-        switch self {
-        case .staticLevel: return 1...1
-        case .breathe:     return 1...20
-        case .heartbeat:   return 0.6...3
-        case .strobe:      return 0.1...2
-        case .keyPulse:    return 0.15...1.5
-        case .audioBeat:   return 0.15...1.5
-        }
-    }
-
-    var defaultPeriod: Double {
-        switch self {
-        case .staticLevel: return 1
-        case .breathe:     return 4
-        case .heartbeat:   return 1.2
-        case .strobe:      return 0.5
-        case .keyPulse:    return 0.4
-        case .audioBeat:   return 0.35
-        }
-    }
-
     /// 按键脉冲不循环，「周期」这个词对它是错的
-    var periodLabel: String {
-        self == .keyPulse || self == .audioBeat ? "脉冲时长" : "周期"
-    }
+    var periodLabel: String { isPulse ? "脉冲时长" : "周期" }
 
     /// 最暗/最亮两个滑块在按键脉冲下的含义是「静息」和「峰值」。
     /// 主界面只用 hi（叫「亮度」），lo 收在高级里，所以这里主要是 lo 的标签。
     var levelLabels: (lo: String, hi: String) {
-        self == .keyPulse || self == .audioBeat ? ("静息亮度", "脉冲峰值") : ("最暗", "最亮")
+        isPulse ? ("静息亮度", "脉冲峰值") : ("最暗", "最亮")
     }
 
     /// 效果选中时的一句说明。**只写「做不到什么」**——
@@ -221,25 +192,45 @@ final class Settings: ObservableObject {
 
     var fps: Double { powerSaver ? 30 : 60 }
 
+    /// **实现在 `Core/EffectFactory.swift`，这里只负责把设置转成 `EffectSpec`。**
+    /// 以前这里是个 switch，`magickey-tool` 里还有一份一模一样的——两份漂了，
+    /// 工具那份甚至没有 audiobeat 分支。理由写在工厂那个文件的开头。
     func makeEffect() -> Effect {
-        switch kind {
-        case .staticLevel: return StaticEffect(level: Float(hi))
-        case .breathe:     return BreatheEffect(period: period, min: Float(lo), max: Float(hi))
-        case .heartbeat:   return HeartbeatEffect(period: period, min: Float(lo), max: Float(hi))
-        case .strobe:      return StrobeEffect(period: period, min: Float(lo), max: Float(hi))
-        case .keyPulse:    return PulseEffect(duration: period, min: Float(lo), max: Float(hi),
-                                             source: KeyboardPulseSource(), name: "keypulse")
-        case .audioBeat:
-            // tap 的启停不在这里做生命周期管理：它比效果活得久（重建要几秒），
-            // 停止由「没人 drain 就自停」的看门狗负责。见 BeatPulseSource 类注释。
-            let src = BeatPulseSource.shared
-            src.sensitivity = Float(sensitivity)
-            src.activate()
-            // ⚠️ filterRepeats 必须为 false：`KeyRepeatFilter` 的判据是
-            // 「连续两个间隔几乎相等 = 自动重复」，而音乐的鼓点**本来就是等间隔**。
-            // 开着的话一首 120BPM 的歌前三拍之后就再也不闪了。
-            return PulseEffect(duration: period, min: Float(lo), max: Float(hi),
-                               source: src, filterRepeats: false, name: "audiobeat")
+        // 灵敏度**不经过效果**：它直推已经在跑的检测器（见 `sensitivity` 的 didSet），
+        // 因为重建 tap 要 1.8–4.6 秒，拖滑块时重建等于卡死。
+        // 这里补一次是因为**启动时读盘不走 didSet**——不补的话 `BeatPulseSource`
+        // 一直用着出厂默认阈值，用户上次调的灵敏度要等他再动一次滑块才生效。
+        if kind == .audioBeat {
+            BeatPulseSource.shared.sensitivity = Float(sensitivity)
         }
+        return EffectFactory.make(EffectSpec(kind: kind, period: period,
+                                             lo: Float(lo), hi: Float(hi)))
     }
+
+    /// 真正会改变**渲染输出**的那几项。
+    ///
+    /// `Engine.apply` 收的是 `Settings` 这个引用对象，没有值语义，所以它没法自己
+    /// 判断「这次变的到底是不是我关心的东西」，只能把每次调用都当成参数变了、
+    /// 把渲染状态整个重建一遍。后果见 `Engine.RenderInputs`。
+    ///
+    /// **加新设置项时的判据**：它会不会改变 `makeEffect()` 的产物或帧率？
+    /// 会 → 加进来；不会 → 千万别加，加了就等于把那个「无关设置也重启动画」的
+    /// bug 再引入一次。
+    var renderInputs: RenderInputs {
+        RenderInputs(enabled: enabled, kind: kind, period: period,
+                     lo: lo, hi: hi, fps: fps)
+    }
+}
+
+/// 见 `Settings.renderInputs`。放在 `Settings` 外面是因为 `Engine` 要存一份
+/// 上次生效的快照，而它不该持有第二个 `Settings` 引用。
+struct RenderInputs: Equatable {
+    let enabled: Bool
+    let kind: EffectKind
+    let period: Double
+    let lo: Double
+    let hi: Double
+    /// `powerSaver` 的派生值。存 fps 而不是 powerSaver：引擎关心的是帧率本身，
+    /// 将来「帧率按效果推导」落地时这里换个算法就行，比较逻辑一个字都不用动。
+    let fps: Double
 }
